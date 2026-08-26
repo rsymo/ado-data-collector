@@ -45,6 +45,14 @@ if [ -z "$ORG" ]; then
 fi
 ORG_URL="https://dev.azure.com/$ORG"
 
+for _tool in az jq curl; do
+    if ! command -v "$_tool" &> /dev/null; then
+        echo "ERROR: Required tool is not installed: $_tool" >&2
+        exit 1
+    fi
+done
+unset _tool
+
 # Validate numeric configuration up front. Unlike an API failure - which must
 # degrade to zero so a partial report is still produced - a malformed setting is
 # a caller error that would otherwise yield a confident-looking report built on
@@ -374,12 +382,22 @@ call_api_paged_skip() {
         body=$(call_api "$url")
 
         if [ "$body" = "API_ERROR" ] || ! echo "$body" | jq empty 2>/dev/null; then
+            if [ "$page" -gt 0 ]; then
+                report_warn "Pagination failed on page $page for ${endpoint%%\?*} - results are TRUNCATED"
+            else
+                report_warn "No data read from ${endpoint%%\?*} - the request failed (auth, permission, or endpoint unavailable). This section reads as ZERO; confirm it is genuinely zero before sizing from it."
+            fi
             break
         fi
 
         local n
         n=$(echo "$body" | jq -r "${jq_path} | length" 2>/dev/null || echo "0")
-        [ -z "$n" ] && n=0
+        case "$n" in
+            ''|*[!0-9]*)
+                report_warn "Unexpected pagination response from ${endpoint%%\?*} - results are TRUNCATED"
+                break
+                ;;
+        esac
         [ "$n" -eq 0 ] && break
 
         echo "$body" | jq -c "${jq_path}[]?" 2>/dev/null
@@ -389,6 +407,10 @@ call_api_paged_skip() {
         skip=$((skip + page_size))
         page=$((page + 1))
     done
+
+    if [ "$page" -ge "$max_pages" ]; then
+        report_warn "Hit page limit ($max_pages) for ${endpoint%%\?*} - results may be truncated"
+    fi
 }
 
 # Collapse newline-delimited JSON into a JSON array file.
@@ -493,21 +515,21 @@ for project in "${projects[@]}"; do
         project_visibility=$(echo "$project_details" | jq -r '.visibility // "private"')
     fi
     
-    # Get repos for this project
-    repos_json=$(call_api "$ORG_URL/$project_encoded/_apis/git/repositories?api-version=$API_VERSION")
-    
-    # Validate JSON response before processing
-    if [ "$repos_json" = "API_ERROR" ] || ! echo "$repos_json" | jq empty 2>/dev/null; then
-        echo "WARNING: Failed to retrieve repositories for project '$project' (skipping)" | tee -a "$REPORT_FILE"
-        continue
-    fi
-    
-    repo_count=$(echo "$repos_json" | jq -r '.value | length')
+    # Repository listings are capped, so drain continuation-token pages instead
+    # of silently undercounting large projects.
+    project_repos_ndjson="$TEMP_DATA_DIR/repos_${project_count}.ndjson"
+    call_api_paged \
+        "$ORG_URL/$project_encoded/_apis/git/repositories?api-version=$API_VERSION" \
+        '.value' > "$project_repos_ndjson"
+
+    repo_count=$(wc -l < "$project_repos_ndjson" | tr -d ' ')
     total_repos=$((total_repos + repo_count))
     
     # Store repo details for later analysis, including project visibility
     # Use jq --arg to safely pass project name and visibility (handles quotes and backslashes)
-    echo "$repos_json" | jq -c --arg proj "$project" --arg vis "$project_visibility" '.value[] | {project: $proj, projectVisibility: $vis, name: .name, id: .id, size: .size, defaultBranch: .defaultBranch, remoteUrl: .remoteUrl}' >> "$REPO_DETAILS_FILE.tmp"
+    jq -c --arg proj "$project" --arg vis "$project_visibility" \
+        '{project: $proj, projectVisibility: $vis, name: .name, id: .id, size: .size, defaultBranch: .defaultBranch, remoteUrl: .remoteUrl}' \
+        "$project_repos_ndjson" >> "$REPO_DETAILS_FILE.tmp" 2>/dev/null
 done
 
 # Consolidate all repo details into a single JSON array
@@ -706,6 +728,7 @@ if [ "$SCAN_LARGE_FILES" = "1" ] && command -v git &> /dev/null; then
         while read -r repo; do
             project=$(echo "$repo" | jq -r '.project')
             repo_name=$(echo "$repo" | jq -r '.name')
+            repo_id=$(echo "$repo" | jq -r '.id')
             
             [ "$DEBUG" = "1" ] && echo "  Scanning $project/$repo_name..." | tee -a "$REPORT_FILE"
             
@@ -713,7 +736,7 @@ if [ "$SCAN_LARGE_FILES" = "1" ] && command -v git &> /dev/null; then
             project_encoded=$(url_encode "$project")
             
             # Create temp directory for this repo
-            repo_temp_dir="$ORIGINAL_DIR/$TEMP_DATA_DIR/scan_${repo_name}_$$"
+            repo_temp_dir="$ORIGINAL_DIR/$TEMP_DATA_DIR/scan_${repo_id}_$$"
             mkdir -p "$repo_temp_dir"
             cd "$repo_temp_dir"
             
@@ -722,10 +745,13 @@ if [ "$SCAN_LARGE_FILES" = "1" ] && command -v git &> /dev/null; then
             header_file="$repo_temp_dir/git_header.txt"
             echo "Authorization: Bearer $ADO_TOKEN" > "$header_file"
             chmod 600 "$header_file"
-            git -c http.extraHeader=@"$header_file" clone --bare --quiet "https://dev.azure.com/$ORG/$project_encoded/_git/$repo_name" repo.git 2>/dev/null
+            repo_encoded=$(url_encode "$repo_name")
+            git -c http.extraHeader=@"$header_file" clone --bare --quiet \
+                "https://dev.azure.com/$ORG/$project_encoded/_git/$repo_encoded" repo.git 2>/dev/null
+            clone_status=$?
             rm -f "$header_file"
             
-            if [ $? -eq 0 ] && [ -d "repo.git" ]; then
+            if [ "$clone_status" -eq 0 ] && [ -d "repo.git" ]; then
                 cd repo.git
                 
                 # Capture distinct commit authors in the history window. Unique
@@ -845,8 +871,11 @@ for project in "${projects[@]}"; do
         # Only loop if we actually have repo IDs (skip empty array)
         if [ ${#project_repos[@]} -gt 0 ] && [ -n "${project_repos[0]}" ]; then
             for repo_id in "${project_repos[@]}"; do
-                pr_response=$(call_api "$ORG_URL/$project_encoded/_apis/git/repositories/$repo_id/pullrequests?api-version=$API_VERSION")
-                pr_count=$(safe_jq_count "$pr_response" '.count')
+                # Pull-request listings are paginated; count every returned
+                # object rather than trusting the first page's count.
+                pr_count=$(call_api_paged \
+                    "$ORG_URL/$project_encoded/_apis/git/repositories/$repo_id/pullrequests?api-version=$API_VERSION" \
+                    '.value' | jq -s 'length')
                 total_pull_requests=$((total_pull_requests + pr_count))
             done
         fi
