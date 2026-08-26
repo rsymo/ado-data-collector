@@ -473,7 +473,7 @@ Notes for building the model:
 - **Bucket 4** — the `customWork` count is the number of distinct integrations needing a named owner and an estimate. Everything in `OOB`/`MARKET`/`PARTNER` is configuration, not development.
 - **Bucket 5** — the report gives denominators only, on purpose. Apply your own staffing ratios to them so the assumptions stay visible and challengeable.
 
-### Comparing Against an Alternative Platform
+### Platform-Neutral Denominators
 
 The same denominators drive any platform's model. Because the export is structured, the platform-specific assumptions stay separate from the estate facts:
 
@@ -523,8 +523,10 @@ This repository also includes example scripts:
 - **No Secrets in Code**: Authentication uses `az login` - no PAT tokens or credentials stored in script
 - **Clean Output**: Progress messages hidden by default; use `DEBUG=1` for detailed output
 - **Secure Cleanup**: Trap handlers ensure temporary files are removed even if script is interrupted
-- **Report Security**: 
-  - Add `ado-data-report-*.txt` to `.gitignore`
+- **Report Security**:
+  - All generated output is already covered by `.gitignore`: `ado-data-report-*`, `ado-sizing-*`, `ado-users-*`, `ado-secret-scanning-*`
+  - `ado-users-*.csv` contains display names and email addresses. Treat it as personal data and handle it under your own data protection obligations
+  - `ado-sizing-*.json` contains the organization name, project names and full estate counts
   - Store reports securely as they contain organizational information
   - Consider encrypting reports if storing long-term
 

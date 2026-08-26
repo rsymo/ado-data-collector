@@ -1,10 +1,12 @@
-# Data collection report output files
-ado-data-report-*.txt
+# Report output. These contain organization data: org and project names,
+# user display names and email addresses, and full estate counts.
+# Never commit them.
+ado-data-report-*
+ado-sizing-*
+ado-users-*
 
 # Secret scanning reports (contains sensitive security information)
-ado-secret-scanning-*.txt
-ado-secret-scanning-*.csv
-ado-secret-scanning-*.json
+ado-secret-scanning-*
 
 # Temporary data directory
 temp_migration_data_*/
