@@ -6,6 +6,20 @@
 # This script collects data from Azure DevOps organizations
 # for GitHub migration planning.
 #
+# READ-ONLY GUARANTEE
+#   This collector never writes to Azure DevOps. It only reads.
+#   Enforced (see "READ-ONLY ENFORCEMENT" below), not merely intended:
+#     - Every HTTP request is pinned to GET, except one allow-listed read-only
+#       query endpoint (WIQL) that Azure DevOps only exposes over POST.
+#     - Every URL is checked against an allow-list of Azure DevOps read hosts
+#       and must be HTTPS; redirects cannot downgrade the scheme.
+#     - Git repositories are cloned bare (a fetch) and inspected locally; the
+#       clone is configured with an unusable push URL.
+#     - Azure CLI is used only for `az account show` and
+#       `az account get-access-token`.
+#     - Any violation aborts the run immediately.
+#   All output is written to the local working directory.
+#
 # Prerequisites:
 #   - Azure CLI installed and logged in (az login)
 #   - jq installed for JSON parsing
@@ -86,6 +100,11 @@ mkdir -p "$TEMP_DATA_DIR"
 WARNINGS_FILE="$TEMP_DATA_DIR/warnings.txt"
 : > "$WARNINGS_FILE"
 
+# Marker written by fatal_read_only_violation before it signals the main shell.
+# It lets the signal handler distinguish "the operator pressed Ctrl-C" from
+# "the read-only policy was breached" and report the correct cause.
+READ_ONLY_VIOLATION_FLAG="$TEMP_DATA_DIR/.read-only-violation"
+
 # Set up cleanup trap to remove temp directory and secure files on exit (success or failure)
 # This ensures bearer tokens in curl config are always cleaned up
 cleanup() {
@@ -93,7 +112,26 @@ cleanup() {
     # Explicitly remove curl config if it exists outside temp dir
     [ -n "$CURL_CONFIG_FILE" ] && rm -f "$CURL_CONFIG_FILE" 2>/dev/null
 }
-trap cleanup EXIT INT TERM
+
+# Signal handling must terminate the run, not merely tidy up. A handler that
+# only cleans up leaves Bash to resume the next statement, so the script would
+# carry on against deleted temp files - which is both how a Ctrl-C used to be
+# ignored and how a read-only violation could otherwise fail to stop the run.
+on_terminating_signal() {
+    local violation=0
+    [ -f "$READ_ONLY_VIOLATION_FLAG" ] && violation=1
+    cleanup
+    if [ "$violation" -eq 1 ]; then
+        echo "Run aborted: read-only policy violation. Nothing was written to Azure DevOps." >&2
+        exit 3
+    fi
+    echo "" >&2
+    echo "Interrupted - cleaning up and exiting." >&2
+    exit 130
+}
+
+trap cleanup EXIT
+trap on_terminating_signal INT TERM
 
 # API version
 API_VERSION="7.1"
@@ -128,6 +166,129 @@ fi
 
 echo "Authentication successful!"
 echo ""
+
+# -------- READ-ONLY ENFORCEMENT --------
+# This collector is strictly READ-ONLY against Azure DevOps. It exists to size a
+# migration, never to modify the source estate. The checks below turn that from a
+# convention into an enforced invariant, so a future edit cannot quietly
+# introduce a mutating call.
+#
+# The rules, in order of strength:
+#   1. Every HTTP request is pinned to GET, except a single allow-listed
+#      read-only query endpoint (WIQL) that Azure DevOps only exposes over POST.
+#   2. Every URL must be HTTPS and must target a known Azure DevOps read host.
+#   3. Redirects may not downgrade to plain HTTP, and may not replay a request
+#      body to a new target.
+#   4. Any violation aborts the entire run rather than degrading silently.
+#
+# PID of the top-level shell. API helpers run inside $(...) command
+# substitution, where a bare `exit` would only kill the subshell and let the
+# run continue. Signalling this PID terminates the real script and fires the
+# cleanup trap that removes the bearer token.
+MAIN_PID=$$
+
+# Hosts this collector is permitted to contact. Adding a host here is a
+# deliberate act: keep it to Azure DevOps endpoints that are read from.
+ADO_ALLOWED_HOSTS="
+dev.azure.com
+vsrm.dev.azure.com
+vsaex.dev.azure.com
+advsec.dev.azure.com
+extmgmt.dev.azure.com
+"
+
+# Endpoints that are semantically reads but that Azure DevOps only serves over
+# POST. WIQL runs a work-item query and returns matching IDs; it creates and
+# changes nothing. Matching is on the URL path only, so query strings cannot be
+# used to smuggle a different endpoint past the check.
+ADO_ALLOWED_POST_PATHS="
+/_apis/wit/wiql
+"
+
+# Abort the whole run. Used only for read-only violations, which are programming
+# errors rather than environmental ones, so degrading to a partial report would
+# be the wrong outcome - the operator must see it.
+fatal_read_only_violation() {
+    echo "" >&2
+    echo "FATAL: read-only policy violation - aborting." >&2
+    echo "  $*" >&2
+    echo "" >&2
+    echo "  This collector must never write to Azure DevOps. If you are adding a" >&2
+    echo "  new call, confirm the endpoint is a read, then extend" >&2
+    echo "  ADO_ALLOWED_HOSTS or ADO_ALLOWED_POST_PATHS explicitly." >&2
+    # Record the cause before signalling, so the handler in the main shell can
+    # tell this apart from an operator interrupt.
+    : > "$READ_ONLY_VIOLATION_FLAG" 2>/dev/null
+    kill -s TERM "$MAIN_PID" 2>/dev/null
+    exit 3
+}
+
+# Extract the host from a URL without spawning a subprocess.
+url_host() {
+    local rest="${1#*://}"
+    rest="${rest%%/*}"
+    rest="${rest%%\?*}"
+    echo "${rest%%:*}"
+}
+
+# Extract the path from a URL, discarding any query string.
+url_path() {
+    local rest="${1#*://}"
+    case "$rest" in
+        */*) rest="/${rest#*/}" ;;
+        *)   rest="/" ;;
+    esac
+    echo "${rest%%\?*}"
+}
+
+# Guard applied to every outbound request: HTTPS only, known host only.
+assert_read_only_url() {
+    local url="$1"
+    local host
+
+    case "$url" in
+        https://*) ;;
+        *) fatal_read_only_violation "Non-HTTPS request blocked: $url" ;;
+    esac
+
+    host=$(url_host "$url")
+    case "
+$ADO_ALLOWED_HOSTS" in
+        *"
+$host
+"*) ;;
+        *) fatal_read_only_violation "Host '$host' is not on the read-only allow-list: $url" ;;
+    esac
+}
+
+# Additional guard for the POST path: the endpoint must be one of the
+# allow-listed read-only query endpoints. Matching is an exact suffix match on
+# the URL path, which has already had its query string stripped - so neither a
+# query parameter nor a longer endpoint name (e.g. .../wiqlSomethingElse) can
+# be used to slip past the check.
+assert_read_only_query_url() {
+    local url="$1"
+    local path allowed
+
+    assert_read_only_url "$url"
+
+    path=$(url_path "$url")
+    while IFS= read -r allowed; do
+        [ -z "$allowed" ] && continue
+        case "$path" in
+            *"$allowed") return 0 ;;
+        esac
+    done <<EOF
+$ADO_ALLOWED_POST_PATHS
+EOF
+
+    fatal_read_only_violation "POST to '$path' is not an allow-listed read-only query endpoint: $url"
+}
+
+# Flags applied to every curl invocation. --proto and --proto-redir stop a
+# redirect from downgrading to cleartext or to a non-HTTP scheme, which would
+# otherwise expose the bearer token.
+CURL_SAFE_OPTS=(--proto '=https' --proto-redir '=https')
 
 # -------- HELPER FUNCTIONS --------
 
@@ -180,21 +341,35 @@ maybe_refresh_token() {
 }
 
 # Function to make Azure DevOps API calls (GET requests)
-# Uses secure curl config file to avoid token exposure in process listings
+# Uses secure curl config file to avoid token exposure in process listings.
+# The method is pinned to GET with -X so that accidentally adding a body flag
+# (-d/--data) later cannot silently promote this to a POST.
 call_api() {
     local endpoint="$1"
+    assert_read_only_url "$endpoint"
     [ "$DEBUG" = "1" ] && echo "[DEBUG] GET: $endpoint" >&2
     curl -s -f -L --max-time 30 --retry 2 --retry-delay 1 \
+        "${CURL_SAFE_OPTS[@]}" \
         --config "$CURL_CONFIG_FILE" \
+        -X GET \
         "$endpoint" 2>/dev/null || echo "API_ERROR"
 }
 
-# Function to make Azure DevOps API POST calls
-call_api_post() {
+# Function to run a read-only Azure DevOps query that the API only exposes over
+# POST (currently WIQL, which returns matching work item IDs and mutates
+# nothing). The endpoint is checked against an allow-list before the request is
+# made, so this helper cannot be repurposed into a write.
+#
+# Redirects are deliberately NOT followed here: a 307/308 would replay the
+# request body against a different target, which is exactly the accidental
+# write this policy exists to prevent.
+call_api_readonly_query() {
     local endpoint="$1"
     local data="$2"
-    [ "$DEBUG" = "1" ] && echo "[DEBUG] POST: $endpoint" >&2
-    curl -s -f -L --max-time 30 --retry 2 --retry-delay 1 \
+    assert_read_only_query_url "$endpoint"
+    [ "$DEBUG" = "1" ] && echo "[DEBUG] POST (read-only query): $endpoint" >&2
+    curl -s -f --max-time 30 --retry 2 --retry-delay 1 \
+        "${CURL_SAFE_OPTS[@]}" \
         --config "$CURL_CONFIG_FILE" \
         -H "Content-Type: application/json" \
         -X POST -d "$data" "$endpoint" 2>/dev/null || echo "API_ERROR"
@@ -309,8 +484,10 @@ call_api_paged() {
 
         : > "$hdr_file"
         local body
+        assert_read_only_url "$url"
         body=$(curl -s -f -L --max-time 60 --retry 2 --retry-delay 1 \
-            --config "$CURL_CONFIG_FILE" -D "$hdr_file" "$url" 2>/dev/null) || body="API_ERROR"
+            "${CURL_SAFE_OPTS[@]}" \
+            --config "$CURL_CONFIG_FILE" -D "$hdr_file" -X GET "$url" 2>/dev/null) || body="API_ERROR"
 
         # A failure here is invisible to the caller: it just receives fewer
         # records, or none. Both cases must be recorded, because a permission
@@ -720,12 +897,25 @@ if [ "$SCAN_LARGE_FILES" = "1" ] && command -v git &> /dev/null; then
             # Clone as bare repository (faster, includes all history)
             # Use Azure AD Bearer token with http.extraHeader for authentication, securely via a temporary file
             header_file="$repo_temp_dir/git_header.txt"
+            clone_url="https://dev.azure.com/$ORG/$project_encoded/_git/$repo_name"
+            # Read-only by construction: clone fetches, and the only Git commands
+            # run afterwards (log, rev-list, cat-file) are local reads. The URL is
+            # checked against the same allow-list as the REST calls, and the clone
+            # is given an unusable push URL as defence in depth, so a `git push`
+            # added here later fails locally instead of reaching Azure DevOps.
+            assert_read_only_url "$clone_url"
             echo "Authorization: Bearer $ADO_TOKEN" > "$header_file"
             chmod 600 "$header_file"
-            git -c http.extraHeader=@"$header_file" clone --bare --quiet "https://dev.azure.com/$ORG/$project_encoded/_git/$repo_name" repo.git 2>/dev/null
+            GIT_TERMINAL_PROMPT=0 git -c http.extraHeader=@"$header_file" \
+                -c remote.origin.pushurl="no-push-read-only-collector" \
+                clone --bare --quiet "$clone_url" repo.git 2>/dev/null
+            # Capture the clone result before anything else runs: the token file
+            # must be removed immediately, and `rm` would otherwise overwrite $?
+            # and make every failed clone look like a success.
+            clone_status=$?
             rm -f "$header_file"
             
-            if [ $? -eq 0 ] && [ -d "repo.git" ]; then
+            if [ "$clone_status" -eq 0 ] && [ -d "repo.git" ]; then
                 cd repo.git
                 
                 # Capture distinct commit authors in the history window. Unique
@@ -828,8 +1018,10 @@ for project in "${projects[@]}"; do
     # URL encode project name
     project_encoded=$(url_encode "$project")
     
-    # Check for work items using POST request
-    wi_response=$(call_api_post "$ORG_URL/$project_encoded/_apis/wit/wiql?api-version=$API_VERSION" '{"query": "Select [System.Id] From WorkItems"}')
+    # Count work items via WIQL. This is a POST because that is the only shape
+    # the WIQL endpoint offers; it runs a query and returns IDs, and is
+    # allow-listed as a read in the read-only enforcement section above.
+    wi_response=$(call_api_readonly_query "$ORG_URL/$project_encoded/_apis/wit/wiql?api-version=$API_VERSION" '{"query": "Select [System.Id] From WorkItems"}')
     work_items=$(safe_jq_count "$wi_response" '.workItems | length')
     
     total_work_items=$((total_work_items + work_items))

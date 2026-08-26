@@ -15,6 +15,32 @@ It answers two related questions:
 
 The report states **factual data only**. It does not price anything or make recommendations — it produces the inputs a cost model or a proposal needs.
 
+### Read-only guarantee
+
+**This script never writes to Azure DevOps.** It only reads. That is enforced in code, not left to convention, so an accidental write cannot slip in through a later change:
+
+| Guard | What it does |
+|---|---|
+| **Method pinning** | Every HTTP request is sent with an explicit `-X GET`. Adding a body flag (`-d`) to a read helper cannot silently promote it to a `POST`. |
+| **POST allow-list** | Exactly one endpoint is reached over `POST`: `_apis/wit/wiql`. WIQL runs a work-item *query* and returns matching IDs — it changes nothing, and Azure DevOps offers no `GET` form of it. Any other `POST` target aborts the run. |
+| **Host allow-list** | Requests must be HTTPS and must target a known Azure DevOps read host (`dev.azure.com`, `vsrm.`, `vsaex.`, `advsec.`, `extmgmt.`). |
+| **Redirect safety** | Redirects cannot downgrade to plain HTTP, and the WIQL query does not follow redirects at all, so a `307`/`308` cannot replay its body against a different target. |
+| **Git** | Repositories are cloned `--bare` (a fetch) and inspected locally with `log`, `rev-list`, and `cat-file`. The clone is configured with an unusable push URL, so an accidental `git push` fails locally. |
+| **Azure CLI** | Used only for `az account show` and `az account get-access-token`. |
+| **Fail closed** | Any violation aborts the entire run immediately with exit code `3`, rather than degrading quietly. |
+
+Everything the script produces is written to your local working directory.
+
+If you extend the script, a new host or a new `POST` endpoint must be added deliberately to `ADO_ALLOWED_HOSTS` or `ADO_ALLOWED_POST_PATHS` in the `READ-ONLY ENFORCEMENT` section — otherwise the run stops with a clear error. Verify the enforcement yourself at any time:
+
+```bash
+# Should print exactly one -X POST, inside call_api_readonly_query
+grep -nE '\-X (POST|PUT|PATCH|DELETE)' ado-data-collector.sh
+
+# Should print exactly three curl calls, each preceded by an assert_read_only_* guard
+grep -n 'curl ' ado-data-collector.sh
+```
+
 ### Relationship to GitHub Actions Importer
 
 This script **complements** [`gh actions-importer audit azure-devops`](https://docs.github.com/en/actions/migrating-to-github-actions/using-github-actions-importer); it does not replace it.
@@ -513,16 +539,20 @@ This repository also includes example scripts:
 - `report-generator-example-2a.sh` - Basic repository metrics with oldest commits
 - `report-generator-example-2b.sh` - Filter repositories by size
 
+These are standalone reference snippets, not part of the collector. They are also read-only against Azure DevOps (`GET` requests, `az ... list` commands, and `git clone`/`git lfs fetch`), but they do **not** carry the enforcement guards described above and, unlike the collector, they authenticate with a PAT. Review them before running.
+
 ## Security Best Practices
 
+- **Read-Only by Enforcement**: The script never writes to Azure DevOps. Requests are pinned to `GET`, hosts are allow-listed, the single `POST` (the WIQL *query* endpoint) is allow-listed by path, Git clones are configured with an unusable push URL, and any violation aborts the run with exit code `3`. See [Read-only guarantee](#read-only-guarantee).
 - **Token Security**: Azure AD bearer tokens are stored in secure temporary files with restrictive permissions (600)
   - Never exposed in process listings or command-line arguments
   - Automatically cleaned up on script exit (success, failure, or interruption)
   - Uses `mktemp` for unpredictable filenames to prevent race conditions
+- **Transport Security**: All requests are HTTPS-only (`--proto '=https'`), and redirects cannot downgrade the scheme (`--proto-redir '=https'`), so a redirect cannot leak the bearer token over cleartext
 - **Token Lifecycle**: Tokens automatically expire after 1 hour; script includes refresh logic for long-running operations
 - **No Secrets in Code**: Authentication uses `az login` - no PAT tokens or credentials stored in script
 - **Clean Output**: Progress messages hidden by default; use `DEBUG=1` for detailed output
-- **Secure Cleanup**: Trap handlers ensure temporary files are removed even if script is interrupted
+- **Secure Cleanup**: Trap handlers ensure temporary files are removed even if script is interrupted; `Ctrl-C` cleans up and stops the run
 - **Report Security**:
   - All generated output is already covered by `.gitignore`: `ado-data-report-*`, `ado-sizing-*`, `ado-users-*`, `ado-secret-scanning-*`
   - `ado-users-*.csv` contains display names and email addresses. Treat it as personal data and handle it under your own data protection obligations
