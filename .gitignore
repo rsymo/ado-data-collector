@@ -1,0 +1,14 @@
+# Data collection report output files
+ado-data-report-*.txt
+
+# Secret scanning reports (contains sensitive security information)
+ado-secret-scanning-*.txt
+ado-secret-scanning-*.csv
+ado-secret-scanning-*.json
+
+# Temporary data directory
+temp_migration_data_*/
+temp_migration_data/
+
+# macOS system files
+.DS_Store
