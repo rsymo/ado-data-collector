@@ -3,8 +3,16 @@
 # ========================================
 # Azure DevOps Data Collector
 # ========================================
-# This script collects data from Azure DevOps organizations
-# for GitHub migration planning.
+# This script builds a read-only inventory of an Azure DevOps organization:
+# what exists, what is actually being used, and what the platform team
+# operates. It is useful for estate review, cleanup and consolidation work on
+# its own.
+#
+# Because the most common reason to inventory an estate is to evaluate a move,
+# later sections additionally express pipeline usage in units that can be
+# compared against other CI providers - notably job-level minutes and the
+# operating-system mix, which is how GitHub Actions bills. Nothing is priced;
+# the collector reports quantities only.
 #
 # READ-ONLY GUARANTEE
 #   This collector never writes to Azure DevOps. It only reads.
@@ -41,6 +49,48 @@ SKIP_BUILD_HISTORY=${SKIP_BUILD_HISTORY:-0}
 HISTORY_DAYS=${HISTORY_DAYS:-90}
 # Maximum builds to retrieve per project (guards against very large orgs)
 MAX_BUILDS_PER_PROJECT=${MAX_BUILDS_PER_PROJECT:-20000}
+# Set SKIP_TIMELINE=1 to skip per-build timeline collection. Timelines are the
+# only source of JOB-level durations, the unit per-job models bill on.
+# Leave it enabled unless the run must be fast.
+SKIP_TIMELINE=${SKIP_TIMELINE:-0}
+# Ceiling on how many builds have their timeline fetched. The collector samples
+# evenly across the collected build history when the estate is larger than this,
+# then extrapolates. Raising it improves precision at the cost of one extra API
+# call per additional build.
+TIMELINE_SAMPLE_MAX=${TIMELINE_SAMPLE_MAX:-1500}
+# Cost multipliers used to convert the observed operating-system mix into a
+# single Linux-equivalent figure. These default to the GitHub-hosted standard
+# runner ratios published at the time of writing. Rates change and vary by
+# plan and runner size, so confirm them against current pricing and override
+# here if they differ.
+# Per-user detail (display names and email addresses) is personal data and is
+# never needed to size an estate. Set EXPORT_USER_DETAILS=1 to additionally
+# write the per-user CSV for internal use; by default only counts are produced.
+EXPORT_USER_DETAILS=${EXPORT_USER_DETAILS:-0}
+# Secret scanning detail identifies the file path, line number and branch where
+# each credential was detected. That is security-sensitive: it is a map of where
+# the unremediated secrets are. Alert COUNTS are always reported; set
+# EXPORT_SECRET_DETAILS=1 to additionally write the per-alert files, which also
+# costs one extra API call per alert.
+EXPORT_SECRET_DETAILS=${EXPORT_SECRET_DETAILS:-0}
+
+# HTTP behaviour. Azure DevOps allows 200 TSTUs per sliding five-minute window
+# per identity; a large estate is thousands of sequential calls, so being
+# throttled at some point is normal rather than exceptional.
+#   API_RETRIES        attempts after the first for a retryable failure. curl
+#                      honours the Retry-After header Azure DevOps returns.
+#   API_RETRY_MAX_TIME ceiling in seconds on the total time ONE call may spend
+#                      retrying. Without it a long Retry-After multiplied by the
+#                      retry count can stall a run for minutes per request.
+#   API_PACING_MS      fixed delay inserted before every request. Normally 0;
+#                      raise it to be deliberately gentle on a busy organization.
+#                      Pacing also escalates automatically once throttling starts.
+API_RETRIES=${API_RETRIES:-5}
+API_RETRY_MAX_TIME=${API_RETRY_MAX_TIME:-120}
+API_PACING_MS=${API_PACING_MS:-0}
+MULT_LINUX=${MULT_LINUX:-1}
+MULT_WINDOWS=${MULT_WINDOWS:-2}
+MULT_MACOS=${MULT_MACOS:-10}
 # Seconds before the Azure AD token is proactively refreshed. Defaulted here
 # (not just at the refresh helper) so it can be validated with the other
 # numeric settings below.
@@ -72,7 +122,7 @@ unset _tool
 # a caller error that would otherwise yield a confident-looking report built on
 # a nonsense window (e.g. HISTORY_DAYS=abc silently becoming a 0-day window).
 # Fail fast so the mistake is corrected before anyone relies on the numbers.
-for _cfg in HISTORY_DAYS MAX_BUILDS_PER_PROJECT TOKEN_MAX_AGE; do
+for _cfg in HISTORY_DAYS MAX_BUILDS_PER_PROJECT TOKEN_MAX_AGE TIMELINE_SAMPLE_MAX API_RETRY_MAX_TIME; do
     eval "_val=\${$_cfg}"
     case "$_val" in
         ''|*[!0-9]*)
@@ -84,6 +134,39 @@ for _cfg in HISTORY_DAYS MAX_BUILDS_PER_PROJECT TOKEN_MAX_AGE; do
         echo "ERROR: $_cfg must be at least 1 (got: '$_val')" >&2
         exit 1
     fi
+done
+unset _cfg _val
+
+# These two may legitimately be zero (no retries, no pacing), so they are
+# checked for "non-negative integer" rather than reusing the loop above.
+for _cfg in API_RETRIES API_PACING_MS; do
+    eval "_val=\${$_cfg}"
+    case "$_val" in
+        ''|*[!0-9]*)
+            echo "ERROR: $_cfg must be a non-negative integer (got: '$_val')" >&2
+            exit 1
+            ;;
+    esac
+done
+unset _cfg _val
+
+# Cost multipliers are validated separately: they may legitimately be decimals
+# (a plan or runner size whose ratio is not a whole number), but a zero or
+# negative value would silently collapse the Linux-equivalent figure to nothing.
+for _cfg in MULT_LINUX MULT_WINDOWS MULT_MACOS; do
+    eval "_val=\${$_cfg}"
+    case "$_val" in
+        ''|*[!0-9.]*|*.*.*|.|*.)
+            echo "ERROR: $_cfg must be a positive number (got: '$_val')" >&2
+            exit 1
+            ;;
+    esac
+    case "$_val" in
+        0|0.|0.0|0.00|.0|.00)
+            echo "ERROR: $_cfg must be greater than zero (got: '$_val')" >&2
+            exit 1
+            ;;
+    esac
 done
 unset _cfg _val
 
@@ -321,14 +404,19 @@ create_curl_config
 # Tokens typically expire after 1 hour, so refresh before long operations
 refresh_token() {
     [ "$DEBUG" = "1" ] && echo "[DEBUG] Refreshing Azure AD token..." >&2
-    local new_token=$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv 2>/dev/null)
+    local new_token=$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv 2>/dev/null </dev/null)
     if [ -n "$new_token" ]; then
         ADO_TOKEN="$new_token"
         # Recreate curl config with new token
         create_curl_config
         TOKEN_ISSUED_AT=$(date +%s)
+        echo "$TOKEN_ISSUED_AT" > "$TOKEN_STATE_FILE"
         [ "$DEBUG" = "1" ] && echo "[DEBUG] Token refreshed successfully" >&2
     else
+        # Back off ~60s before trying again instead of leaving the clock stale.
+        # Without this a broken `az` would be re-invoked on every subsequent
+        # request for the rest of the run.
+        echo "$(( $(date +%s) - TOKEN_MAX_AGE + 60 ))" > "$TOKEN_STATE_FILE"
         [ "$DEBUG" = "1" ] && echo "[DEBUG] WARNING: Failed to refresh token, continuing with existing token" >&2
     fi
 }
@@ -339,13 +427,160 @@ refresh_token() {
 TOKEN_ISSUED_AT=$(date +%s)
 TOKEN_MAX_AGE=${TOKEN_MAX_AGE:-2400}
 
+# The token clock lives in a file, not just a variable. Requests are made inside
+# command substitution, so a refresh triggered by a request happens in a
+# subshell: the refreshed token itself propagates (it is written to the curl
+# config file), but a variable holding the issue time would not, and every later
+# request would then re-invoke `az`. This matters more now that a throttled run
+# can spend far longer inside a single section than the token's lifetime.
+TOKEN_STATE_FILE="$TEMP_DATA_DIR/token_issued_at"
+echo "$TOKEN_ISSUED_AT" > "$TOKEN_STATE_FILE"
+
 maybe_refresh_token() {
-    local now age
+    local now age issued
     now=$(date +%s)
-    age=$((now - TOKEN_ISSUED_AT))
+    issued=$(cat "$TOKEN_STATE_FILE" 2>/dev/null); : "${issued:=$TOKEN_ISSUED_AT}"
+    age=$((now - issued))
     if [ "$age" -ge "$TOKEN_MAX_AGE" ]; then
         refresh_token
     fi
+}
+
+# -------- HTTP TRANSPORT --------
+#
+# Every request goes through _http_exec, which exists to make one distinction
+# the original implementation could not: WHY a request failed.
+#
+# curl -f was removed deliberately. It suppresses the response body and exits 22
+# for every HTTP error alike, so a 429 ("slow down, try again") looked identical
+# to a 403 ("you will never be allowed to read this"). Those demand opposite
+# responses from the operator, and silently reporting a throttled endpoint as a
+# genuine zero is the most expensive mistake this tool can make. Status handling
+# is therefore explicit here: anything outside 2xx becomes API_ERROR, exactly as
+# before, but the status is recorded first.
+#
+# Throttling behaviour:
+#   - Azure DevOps returns Retry-After on 429 and curl honours it natively.
+#   - --retry-max-time bounds the total time a single call may spend retrying,
+#     so one long Retry-After cannot stall the run for minutes.
+#   - Every 429 escalates a process-wide inter-request delay, so a run that
+#     starts being throttled backs off instead of continuing to push against
+#     the limit.
+#
+# State lives in files, not variables: call_api is invoked through command
+# substitution, and a subshell cannot report anything back through a variable.
+
+HTTP_STATE_DIR="$TEMP_DATA_DIR/http"
+mkdir -p "$HTTP_STATE_DIR" 2>/dev/null
+HTTP_LAST_STATUS_FILE="$HTTP_STATE_DIR/last_status"
+HTTP_STATUS_LOG="$HTTP_STATE_DIR/status_log"      # one non-2xx status per line
+HTTP_THROTTLE_FILE="$HTTP_STATE_DIR/throttle_count"
+: > "$HTTP_STATUS_LOG"
+echo 0 > "$HTTP_THROTTLE_FILE"
+echo 0 > "$HTTP_LAST_STATUS_FILE"
+
+http_throttle_count() { cat "$HTTP_THROTTLE_FILE" 2>/dev/null || echo 0; }
+http_last_status()    { cat "$HTTP_LAST_STATUS_FILE" 2>/dev/null || echo 0; }
+
+# Plain-language cause for a status code. Used to make warnings actionable:
+# "rate-limited" and "permission denied" need completely different responses.
+http_status_hint() {
+    case "$1" in
+        429)     echo "rate-limited by Azure DevOps (HTTP 429) - the figure may be incomplete" ;;
+        401)     echo "authentication failed or the token expired (HTTP 401)" ;;
+        403)     echo "permission denied (HTTP 403)" ;;
+        404)     echo "not found (HTTP 404) - the resource or API version may not exist here" ;;
+        5??)     echo "Azure DevOps server error (HTTP $1)" ;;
+        000|0|"") echo "network failure, timeout, or no response" ;;
+        *)       echo "HTTP $1" ;;
+    esac
+}
+
+# Inter-request delay in seconds. Starts at API_PACING_MS and escalates as
+# throttling is observed, so the run slows itself down rather than being
+# throttled harder. It never decreases: once an organization has shown it will
+# throttle this identity, backing off again would just re-trigger it.
+_http_pace() {
+    local throttles base
+    throttles=$(http_throttle_count)
+    base="$API_PACING_MS"
+    if   [ "$throttles" -ge 11 ]; then [ "$base" -lt 2000 ] && base=2000
+    elif [ "$throttles" -ge 6 ];  then [ "$base" -lt 1000 ] && base=1000
+    elif [ "$throttles" -ge 3 ];  then [ "$base" -lt 500 ]  && base=500
+    elif [ "$throttles" -ge 1 ];  then [ "$base" -lt 250 ]  && base=250
+    fi
+    [ "$base" -le 0 ] && return 0
+    # Integer milliseconds -> fractional seconds without needing bc.
+    sleep "$((base / 1000)).$(printf '%03d' "$((base % 1000))")" 2>/dev/null
+}
+
+# Core transport. Echoes the response body, or the literal API_ERROR.
+#   $1 url   $2 max-time   $3 header dump file ("" for none)
+#   $4 method (GET|POST)   $5 POST body ("" for none)   $6 follow redirects (1|0)
+_http_exec() {
+    local url="$1" max_time="$2" hdr_file="$3" method="$4" data="$5" follow="$6"
+    local status rc body_file
+    local -a opts=()
+
+    # Defence in depth. Both callers already assert before calling, but this is
+    # now the single point through which every request in the tool passes, so
+    # re-asserting here means a future caller cannot bypass the read-only
+    # guarantee by forgetting to. Both assertions are idempotent.
+    if [ "$method" = "POST" ]; then
+        assert_read_only_query_url "$url"
+    else
+        assert_read_only_url "$url"
+    fi
+
+    # A long, throttled section can now outlive the token, so the check happens
+    # per request rather than only at section boundaries.
+    maybe_refresh_token
+    _http_pace
+
+    body_file=$(mktemp "$HTTP_STATE_DIR/body.XXXXXX") || { echo "API_ERROR"; return 0; }
+
+    [ "$follow" = "1" ] && opts+=(-L)
+    [ -n "$hdr_file" ] && opts+=(-D "$hdr_file")
+    if [ "$method" = "POST" ]; then
+        opts+=(-H "Content-Type: application/json" -X POST -d "$data")
+    else
+        opts+=(-X GET)
+    fi
+
+    # stdin is closed so a call made inside a `while read` loop cannot consume
+    # the loop's input.
+    status=$(curl -s --max-time "$max_time" \
+        --retry "$API_RETRIES" --retry-delay 1 --retry-max-time "$API_RETRY_MAX_TIME" \
+        "${CURL_SAFE_OPTS[@]}" \
+        --config "$CURL_CONFIG_FILE" \
+        "${opts[@]}" \
+        -o "$body_file" -w '%{http_code}' \
+        "$url" 2>/dev/null </dev/null)
+    rc=$?
+    [ -z "$status" ] && status=0
+
+    echo "$status" > "$HTTP_LAST_STATUS_FILE"
+
+    case "$status" in
+        2??)
+            cat "$body_file"
+            rm -f "$body_file"
+            return 0
+            ;;
+    esac
+
+    # Record the failure class so the end of the run can explain what went wrong
+    # rather than leaving a wall of zeros with no cause.
+    echo "$status" >> "$HTTP_STATUS_LOG"
+    if [ "$status" = "429" ]; then
+        echo "$(( $(http_throttle_count) + 1 ))" > "$HTTP_THROTTLE_FILE"
+        [ "$DEBUG" = "1" ] && echo "[DEBUG] throttled (429), pacing escalated: $url" >&2
+    fi
+    [ "$DEBUG" = "1" ] && echo "[DEBUG] HTTP $status (curl rc=$rc): $url" >&2
+
+    rm -f "$body_file"
+    echo "API_ERROR"
+    return 0
 }
 
 # Function to make Azure DevOps API calls (GET requests)
@@ -356,11 +591,7 @@ call_api() {
     local endpoint="$1"
     assert_read_only_url "$endpoint"
     [ "$DEBUG" = "1" ] && echo "[DEBUG] GET: $endpoint" >&2
-    curl -s -f -L --max-time 30 --retry 2 --retry-delay 1 \
-        "${CURL_SAFE_OPTS[@]}" \
-        --config "$CURL_CONFIG_FILE" \
-        -X GET \
-        "$endpoint" 2>/dev/null || echo "API_ERROR"
+    _http_exec "$endpoint" 30 "" GET "" 1
 }
 
 # Function to run a read-only Azure DevOps query that the API only exposes over
@@ -376,11 +607,11 @@ call_api_readonly_query() {
     local data="$2"
     assert_read_only_query_url "$endpoint"
     [ "$DEBUG" = "1" ] && echo "[DEBUG] POST (read-only query): $endpoint" >&2
-    curl -s -f --max-time 30 --retry 2 --retry-delay 1 \
-        "${CURL_SAFE_OPTS[@]}" \
-        --config "$CURL_CONFIG_FILE" \
-        -H "Content-Type: application/json" \
-        -X POST -d "$data" "$endpoint" 2>/dev/null || echo "API_ERROR"
+    # Redirects are NOT followed here (final argument 0). This is the only
+    # request in the tool that carries a body, and replaying that body against
+    # a redirect target would send the query somewhere the read-only allow-list
+    # never vetted.
+    _http_exec "$endpoint" 30 "" POST "$data" 0
 }
 
 # Function to safely extract a numeric value from JSON.
@@ -443,6 +674,18 @@ num() {
     esac
 }
 
+# Decimal-safe counterpart to num(). Ratios and averages are not integers, and
+# num() would silently flatten them to zero, so any fractional value bound with
+# --argjson must pass through here instead.
+numf() {
+    local v
+    v=$(printf '%s' "${1:-0}" | tr -d '[:space:]')
+    case "$v" in
+        ''|*[!0-9.]*|*.*.*|.|*.) echo "0" ;;
+        *) echo "$v" ;;
+    esac
+}
+
 # Record a warning. Deliberately avoids stdout: the pagination helpers stream
 # NDJSON on stdout, so anything written there would corrupt the data. Warnings
 # go to stderr and are appended to the report so a truncated collection is
@@ -493,9 +736,7 @@ call_api_paged() {
         : > "$hdr_file"
         local body
         assert_read_only_url "$url"
-        body=$(curl -s -f -L --max-time 60 --retry 2 --retry-delay 1 \
-            "${CURL_SAFE_OPTS[@]}" \
-            --config "$CURL_CONFIG_FILE" -D "$hdr_file" -X GET "$url" 2>/dev/null) || body="API_ERROR"
+        body=$(_http_exec "$url" 60 "$hdr_file" GET "" 1)
 
         # A failure here is invisible to the caller: it just receives fewer
         # records, or none. Both cases must be recorded, because a permission
@@ -503,10 +744,12 @@ call_api_paged() {
         # reporting "0 service connections to migrate" when the account simply
         # could not read them is the most expensive mistake this tool can make.
         if [ "$body" = "API_ERROR" ] || ! echo "$body" | jq empty 2>/dev/null; then
+            local why
+            why=$(http_status_hint "$(http_last_status)")
             if [ "$page" -gt 0 ]; then
-                report_warn "Pagination failed on page $page for ${endpoint%%\?*} - results are TRUNCATED"
+                report_warn "Pagination failed on page $page for ${endpoint%%\?*} - $why - results are TRUNCATED"
             else
-                report_warn "No data read from ${endpoint%%\?*} - the request failed (auth, permission, or endpoint unavailable). This section reads as ZERO; confirm it is genuinely zero before sizing from it."
+                report_warn "No data read from ${endpoint%%\?*} - $why. This section reads as ZERO; confirm it is genuinely zero before sizing from it."
             fi
             break
         fi
@@ -943,7 +1186,7 @@ if [ "$SCAN_LARGE_FILES" = "1" ] && command -v git &> /dev/null; then
                 cd repo.git
                 
                 # Capture distinct commit authors in the history window. Unique
-                # committers are the billing unit for GitHub Advanced Security,
+                # committer counts are a common licensing unit for security tooling,
                 # so this is collected while the clone is already local.
                 git log --all --since="${HISTORY_DAYS} days ago" --format='%ae' 2>/dev/null \
                     | tr '[:upper:]' '[:lower:]' \
@@ -987,8 +1230,9 @@ if [ "$SCAN_LARGE_FILES" = "1" ] && command -v git &> /dev/null; then
     
     if [ "$total_large_files" -gt 0 ]; then
         echo "" | tee -a "$REPORT_FILE"
-        echo "NOTE: GitHub warns about files >50MB and blocks files >100MB." | tee -a "$REPORT_FILE"
-        echo "Consider using Git LFS for these files during migration." | tee -a "$REPORT_FILE"
+        echo "NOTE: most Git hosts enforce a per-file size limit, commonly a" | tee -a "$REPORT_FILE"
+        echo "warning around 50MB and a hard block around 100MB. Large binaries" | tee -a "$REPORT_FILE"
+        echo "also slow every clone and fetch. Git LFS is the usual remedy." | tee -a "$REPORT_FILE"
     fi
     
 else
@@ -1007,10 +1251,10 @@ else
     echo "  2. Use Azure Repos web interface to browse repository contents" | tee -a "$REPORT_FILE"
     echo "  3. Check if Git LFS is already configured: git lfs ls-files" | tee -a "$REPORT_FILE"
     echo "" | tee -a "$REPORT_FILE"
-    echo "GitHub migration considerations:" | tee -a "$REPORT_FILE"
-    echo "  - GitHub warns about files >50MB" | tee -a "$REPORT_FILE"
-    echo "  - GitHub blocks files >100MB" | tee -a "$REPORT_FILE"
-    echo "  - Consider using Git LFS for binary files and large assets" | tee -a "$REPORT_FILE"
+    echo "Why this matters:" | tee -a "$REPORT_FILE"
+    echo "  - most Git hosts warn above ~50MB and block above ~100MB per file" | tee -a "$REPORT_FILE"
+    echo "  - large binaries slow every clone, fetch and CI checkout" | tee -a "$REPORT_FILE"
+    echo "  - Git LFS is the usual remedy for binary files and large assets" | tee -a "$REPORT_FILE"
     echo "" | tee -a "$REPORT_FILE"
     
     # Initialize variables for summary
@@ -1028,7 +1272,7 @@ fi
 # ========================================
 # 7. METADATA DATA
 # ========================================
-write_section "7. Metadata Data"
+write_section "7. Work Items, Pull Requests & Project Metadata"
 
 echo "Checking for work items, pull requests, and boards..." | tee -a "$REPORT_FILE"
 
@@ -1140,7 +1384,7 @@ for project in "${projects[@]}"; do
             createdOn: (.createdOn // null)
           }' >> "$TEMP_DATA_DIR/release_defs.ndjson" 2>/dev/null
 
-    # Task groups have no GitHub equivalent - each becomes a composite action
+    # Task groups rarely port directly - each becomes a reusable unit
     # or reusable workflow, so the count is a direct effort input.
     call_api_paged \
         "$ORG_URL/$project_encoded/_apis/distributedtask/taskgroups?api-version=7.1-preview.1" \
@@ -1148,7 +1392,10 @@ for project in "${projects[@]}"; do
         | jq -c --arg proj "$project" '{project: $proj, id: .id, name: (.name // null)}' \
         >> "$TEMP_DATA_DIR/taskgroups.ndjson" 2>/dev/null
 
-    # Variable groups map to Actions variables / environment secrets
+    # Variable groups map to Actions variables / environment secrets. The secret
+    # count is separated because secrets cannot be exported from Azure DevOps -
+    # every one is a manual re-entry during migration, so it is an effort input
+    # in its own right rather than just a variable count.
     call_api_paged \
         "$ORG_URL/$project_encoded/_apis/distributedtask/variablegroups?api-version=7.1-preview.1" \
         '.value' \
@@ -1157,6 +1404,8 @@ for project in "${projects[@]}"; do
             id: .id,
             name: (.name // null),
             variableCount: ((.variables // {}) | length),
+            secretCount: ((.variables // {}) | to_entries
+                          | map(select((.value.isSecret // false) == true)) | length),
             isKeyVault: ((.type // "Vsts") != "Vsts")
           }' >> "$TEMP_DATA_DIR/variablegroups.ndjson" 2>/dev/null
 done
@@ -1178,6 +1427,7 @@ total_release_defs=$(jq 'length' "$RELEASE_DEFS_FILE")
 total_taskgroups=$(jq 'length' "$TASKGROUPS_FILE")
 total_vargroups=$(jq 'length' "$VARGROUPS_FILE")
 total_variables=$(jq '[.[].variableCount] | add // 0' "$VARGROUPS_FILE")
+total_secret_variables=$(jq '[.[].secretCount] | add // 0' "$VARGROUPS_FILE")
 keyvault_vargroups=$(jq '[.[] | select(.isKeyVault)] | length' "$VARGROUPS_FILE")
 
 echo "Total Build Pipelines: $total_pipelines" | tee -a "$REPORT_FILE"
@@ -1191,6 +1441,7 @@ echo "" | tee -a "$REPORT_FILE"
 echo "Classic Release Pipelines: $total_release_defs" | tee -a "$REPORT_FILE"
 echo "Task Groups: $total_taskgroups" | tee -a "$REPORT_FILE"
 echo "Variable Groups: $total_vargroups (containing $total_variables variables)" | tee -a "$REPORT_FILE"
+echo "  Secret variables (manual re-entry on migration): $total_secret_variables" | tee -a "$REPORT_FILE"
 echo "  Azure Key Vault backed groups: $keyvault_vargroups" | tee -a "$REPORT_FILE"
 
 # Per-project pipeline distribution helps identify which teams carry the load
@@ -1234,22 +1485,25 @@ if [ "$advsec_test" != "API_ERROR" ] && echo "$advsec_test" | jq empty 2>/dev/nu
     echo "Advanced Security is enabled for this organization" | tee -a "$REPORT_FILE"
     echo "" | tee -a "$REPORT_FILE"
     
-    # Initialize secret scanning detailed report
-    echo "Azure DevOps Secret Scanning Detailed Report" > "$SECRET_SCANNING_REPORT"
-    echo "Organization: $ORG" >> "$SECRET_SCANNING_REPORT"
-    echo "Generated: $(date)" >> "$SECRET_SCANNING_REPORT"
-    echo "" >> "$SECRET_SCANNING_REPORT"
-    echo "========================================" >> "$SECRET_SCANNING_REPORT"
-    echo "" >> "$SECRET_SCANNING_REPORT"
+    # Initialize secret scanning detail files only when explicitly requested.
+    # Alert counts are collected either way.
+    if [ "$EXPORT_SECRET_DETAILS" = "1" ]; then
+        echo "Azure DevOps Secret Scanning Detailed Report" > "$SECRET_SCANNING_REPORT"
+        echo "Organization: $ORG" >> "$SECRET_SCANNING_REPORT"
+        echo "Generated: $(date)" >> "$SECRET_SCANNING_REPORT"
+        echo "" >> "$SECRET_SCANNING_REPORT"
+        echo "========================================" >> "$SECRET_SCANNING_REPORT"
+        echo "" >> "$SECRET_SCANNING_REPORT"
     
-    # Initialize CSV file with headers
-    echo "Project,Repository,Repository ID,Alert ID,Secret Type,Severity,Confidence,State,Validation Status,Validation Message,File Path,Start Line,End Line,Branch,Introduced Date,First Seen,Last Seen,Detection Tools,Alert URL" > "$SECRET_SCANNING_CSV"
+        # Initialize CSV file with headers
+        echo "Project,Repository,Repository ID,Alert ID,Secret Type,Severity,Confidence,State,Validation Status,Validation Message,File Path,Start Line,End Line,Branch,Introduced Date,First Seen,Last Seen,Detection Tools,Alert URL" > "$SECRET_SCANNING_CSV"
     
-    # Initialize JSON file with metadata and empty alerts array
-    jq -n \
-        --arg org "$ORG" \
-        --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '{organization: $org, generated: $generated, alerts: []}' > "$SECRET_SCANNING_JSON"
+        # Initialize JSON file with metadata and empty alerts array
+        jq -n \
+            --arg org "$ORG" \
+            --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{organization: $org, generated: $generated, alerts: []}' > "$SECRET_SCANNING_JSON"
+    fi
     
     # Iterate through all projects and their repositories
     for project in "${projects[@]}"; do
@@ -1284,8 +1538,9 @@ if [ "$advsec_test" != "API_ERROR" ] && echo "$advsec_test" | jq empty 2>/dev/nu
                     secret_count=$(echo "$secret_alerts" | jq '.count // 0' 2>/dev/null || echo "0")
                     [ "$DEBUG" = "1" ] && echo "[DEBUG] Secret alerts response: $secret_alerts" >&2
                     
-                    # Export detailed secret scanning information if alerts are found
-                    if [ "$secret_count" -gt 0 ]; then
+                    # Export detailed secret scanning information if alerts are
+                    # found AND per-alert detail was explicitly requested.
+                    if [ "$secret_count" -gt 0 ] && [ "$EXPORT_SECRET_DETAILS" = "1" ]; then
                         echo "----------------------------------------" >> "$SECRET_SCANNING_REPORT"
                         echo "Project: $project" >> "$SECRET_SCANNING_REPORT"
                         echo "Repository: $repo_name" >> "$SECRET_SCANNING_REPORT"
@@ -1490,9 +1745,18 @@ if [ "$advsec_test" != "API_ERROR" ] && echo "$advsec_test" | jq empty 2>/dev/nu
     # Add reference to detailed secret scanning report if secrets were found
     if [ "$total_secret_alerts" -gt 0 ]; then
         echo "" | tee -a "$REPORT_FILE"
-        echo "Detailed secret scanning report saved to: $SECRET_SCANNING_REPORT" | tee -a "$REPORT_FILE"
-        echo "Secret scanning CSV (Excel-compatible) saved to: $SECRET_SCANNING_CSV" | tee -a "$REPORT_FILE"
-        echo "Secret scanning JSON (machine-readable) saved to: $SECRET_SCANNING_JSON" | tee -a "$REPORT_FILE"
+        if [ "$EXPORT_SECRET_DETAILS" = "1" ]; then
+            echo "Detailed secret scanning report saved to: $SECRET_SCANNING_REPORT" | tee -a "$REPORT_FILE"
+            echo "Secret scanning CSV (Excel-compatible) saved to: $SECRET_SCANNING_CSV" | tee -a "$REPORT_FILE"
+            echo "Secret scanning JSON (machine-readable) saved to: $SECRET_SCANNING_JSON" | tee -a "$REPORT_FILE"
+            echo "  These files record WHERE each credential was found (file path," | tee -a "$REPORT_FILE"
+            echo "  line and branch), never the value. Treat them as security-" | tee -a "$REPORT_FILE"
+            echo "  sensitive and share only with the remediation team." | tee -a "$REPORT_FILE"
+        else
+            echo "Per-alert detail was NOT exported. The counts above are all that" | tee -a "$REPORT_FILE"
+            echo "  estate review requires. Set EXPORT_SECRET_DETAILS=1 to write the" | tee -a "$REPORT_FILE"
+            echo "  file paths and line numbers for the remediation team." | tee -a "$REPORT_FILE"
+        fi
     fi
 else
     echo "Advanced Security is NOT enabled for this organization" | tee -a "$REPORT_FILE"
@@ -1502,8 +1766,9 @@ else
     echo "  - Dependency scanning (vulnerable packages)" | tee -a "$REPORT_FILE"
     echo "  - Code scanning (security vulnerabilities)" | tee -a "$REPORT_FILE"
     echo "" | tee -a "$REPORT_FILE"
-    echo "Alternative: Consider using third-party security scanning tools or" | tee -a "$REPORT_FILE"
-    echo "GitHub Advanced Security after migration." | tee -a "$REPORT_FILE"
+    echo "If scanning coverage is a requirement, it is currently being met by" | tee -a "$REPORT_FILE"
+    echo "third-party tooling in the pipelines, or not at all. Section 10 lists" | tee -a "$REPORT_FILE"
+    echo "the security extensions actually in use." | tee -a "$REPORT_FILE"
 fi
 
 # ========================================
@@ -1652,7 +1917,7 @@ if [ "$user_count" -gt 0 ]; then
 
     # Activity windows. lastAccessedDate is unset (year 0001) for users who
     # have never signed in - those are pure licence waste and should not be
-    # carried into the GitHub seat count.
+    # carried into the seat count on a platform without a free tier.
     active_30=$(jq --arg c "$(iso_days_ago 30)" \
         '[.[] | select((.lastAccessedDate // "") > $c)] | length' "$USERS_FILE")
     active_60=$(jq --arg c "$(iso_days_ago 60)" \
@@ -1681,32 +1946,46 @@ if [ "$user_count" -gt 0 ]; then
     echo "  Active (90d) users:           $active_90" | tee -a "$REPORT_FILE"
     echo "  Stakeholder users:            $stakeholder_count" | tee -a "$REPORT_FILE"
     echo "" | tee -a "$REPORT_FILE"
-    echo "  IMPORTANT: Stakeholder access is free in Azure DevOps but has no" | tee -a "$REPORT_FILE"
-    echo "  free equivalent on GitHub - every Stakeholder who needs access" | tee -a "$REPORT_FILE"
-    echo "  becomes a paid GitHub Enterprise seat. This is the most common" | tee -a "$REPORT_FILE"
-    echo "  source of budget surprise in ADO-to-GitHub licensing models." | tee -a "$REPORT_FILE"
+    echo "  NOTE: Stakeholder access is free in Azure DevOps. Most other" | tee -a "$REPORT_FILE"
+    echo "  platforms have no equivalent free tier, so Stakeholders who still" | tee -a "$REPORT_FILE"
+    echo "  need access can convert to paid seats under a different licensing" | tee -a "$REPORT_FILE"
+    echo "  model. They are counted separately here so seat planning can test" | tee -a "$REPORT_FILE"
+    echo "  that assumption rather than inherit it." | tee -a "$REPORT_FILE"
 
-    # Export user list to CSV in the working directory so it survives the
-    # temp-directory cleanup trap.
-    echo "displayName,emailAddress,accessLevel,licensingSource,lastAccessDate,dateCreated" > "$USER_CSV"
-    jq -r '.[] | [
-            (.user.displayName // ""),
-            (.user.mailAddress // ""),
-            (.accessLevel.accountLicenseType // ""),
-            (.accessLevel.licensingSource // ""),
-            (.lastAccessedDate // ""),
-            (.dateCreated // "")
-          ] | @csv' "$USERS_FILE" >> "$USER_CSV" 2>/dev/null
-    echo "" | tee -a "$REPORT_FILE"
-    echo "User details exported to: $USER_CSV" | tee -a "$REPORT_FILE"
+    # Per-user detail is personal data (names and email addresses) and is not
+    # needed for estate sizing or cost modelling - the counts above already
+    # cover that. It is therefore opt-in, so the default output of this script
+    # can be shared without disclosing who works at the organization.
+    if [ "$EXPORT_USER_DETAILS" = "1" ]; then
+        # Written to the working directory so it survives the temp-directory
+        # cleanup trap.
+        echo "displayName,emailAddress,accessLevel,licensingSource,lastAccessDate,dateCreated" > "$USER_CSV"
+        jq -r '.[] | [
+                (.user.displayName // ""),
+                (.user.mailAddress // ""),
+                (.accessLevel.accountLicenseType // ""),
+                (.accessLevel.licensingSource // ""),
+                (.lastAccessedDate // ""),
+                (.dateCreated // "")
+              ] | @csv' "$USERS_FILE" >> "$USER_CSV" 2>/dev/null
+        echo "" | tee -a "$REPORT_FILE"
+        echo "User details exported to: $USER_CSV" | tee -a "$REPORT_FILE"
+        echo "  This file contains PERSONAL DATA (names and email addresses)." | tee -a "$REPORT_FILE"
+        echo "  Keep it internal. It is not required for estate sizing." | tee -a "$REPORT_FILE"
+    else
+        echo "" | tee -a "$REPORT_FILE"
+        echo "  Per-user detail (names, email addresses) was NOT exported." | tee -a "$REPORT_FILE"
+        echo "  The counts above are all that estate sizing requires. Set" | tee -a "$REPORT_FILE"
+        echo "  EXPORT_USER_DETAILS=1 to write the per-user CSV for internal use." | tee -a "$REPORT_FILE"
+    fi
 else
     echo "WARNING: No user entitlement data retrieved." | tee -a "$REPORT_FILE"
     echo "  This usually means the account lacks Member Entitlement Management" | tee -a "$REPORT_FILE"
     echo "  permissions on the organization." | tee -a "$REPORT_FILE"
 fi
 
-# Unique committers over the history window - the billing unit for GitHub
-# Advanced Security. Only available when repositories were cloned.
+# Unique committers over the history window - a common licensing unit for
+# security and code-quality tooling. Only available when repositories were cloned.
 unique_committers=0
 if [ "$SCAN_LARGE_FILES" = "1" ] && [ -f "$TEMP_DATA_DIR/committers.txt" ]; then
     # `grep -c .` prints 0 AND exits 1 on no match, so a `|| echo 0` fallback
@@ -1716,7 +1995,9 @@ if [ "$SCAN_LARGE_FILES" = "1" ] && [ -f "$TEMP_DATA_DIR/committers.txt" ]; then
     unique_committers=$(num "$unique_committers")
     echo "" | tee -a "$REPORT_FILE"
     echo "Unique Committers (last $HISTORY_DAYS days): $unique_committers" | tee -a "$REPORT_FILE"
-    echo "  This is the billing unit for GitHub Advanced Security." | tee -a "$REPORT_FILE"
+    echo "  Security and code-quality products are often licensed per active" | tee -a "$REPORT_FILE"
+    echo "  committer rather than per user, so this is usually a smaller and" | tee -a "$REPORT_FILE"
+    echo "  more accurate seat count than total provisioned users." | tee -a "$REPORT_FILE"
 else
     echo "" | tee -a "$REPORT_FILE"
     echo "Unique Committers: not collected (re-run with SCAN_LARGE_FILES=1)" | tee -a "$REPORT_FILE"
@@ -1754,6 +2035,7 @@ total_build_minutes=0
 builds_per_month=0
 minutes_per_month=0
 peak_concurrency=0
+avg_concurrency=0
 queue_p50=0
 queue_p95=0
 failure_rate=0
@@ -1797,6 +2079,7 @@ else
             "$builds_page_cap" \
             | jq -c --arg proj "$project" '{
                 project: $proj,
+                id: .id,
                 definitionId: (.definition.id // null),
                 definitionName: (.definition.name // null),
                 result: (.result // "unknown"),
@@ -1866,6 +2149,8 @@ else
                     (($b | map(select(._dur != null) | ._dur) | pct(0.95)) / 60 * 100 | floor) / 100),
                 queueWaitP50Seconds: (($waits | pct(0.5)) | floor),
                 queueWaitP95Seconds: (($waits | pct(0.95)) | floor),
+                avgConcurrency: (
+                    (($totalSec / ($days * 86400)) * 100 | floor) / 100),
                 peakConcurrency: (
                     [ $b[] | select(._s != null and ._f != null)
                       | ({t: ._s, d: 1}, {t: ._f, d: -1}) ]
@@ -1902,6 +2187,7 @@ else
         peak_concurrency=$(jq -r '.peakConcurrency // 0' "$BUILD_STATS_FILE")
         queue_p50=$(jq -r '.queueWaitP50Seconds // 0' "$BUILD_STATS_FILE")
         queue_p95=$(jq -r '.queueWaitP95Seconds // 0' "$BUILD_STATS_FILE")
+        avg_concurrency=$(jq -r '.avgConcurrency // 0' "$BUILD_STATS_FILE")
 
         echo "Builds in last $HISTORY_DAYS days: $total_builds" | tee -a "$REPORT_FILE"
         echo "Builds per month (normalised):     $builds_per_month" | tee -a "$REPORT_FILE"
@@ -1915,6 +2201,7 @@ else
         echo "" | tee -a "$REPORT_FILE"
         echo "Concurrency & Queueing:" | tee -a "$REPORT_FILE"
         echo "  Peak concurrent builds observed: $peak_concurrency" | tee -a "$REPORT_FILE"
+        echo "  Average concurrent builds:       $avg_concurrency" | tee -a "$REPORT_FILE"
         echo "  Queue wait P50: ${queue_p50}s" | tee -a "$REPORT_FILE"
         echo "  Queue wait P95: ${queue_p95}s" | tee -a "$REPORT_FILE"
 
@@ -1950,11 +2237,14 @@ else
         fi
 
         echo "" | tee -a "$REPORT_FILE"
-        echo "SIZING CAVEAT: Azure DevOps minutes do not convert 1:1 to GitHub" | tee -a "$REPORT_FILE"
-        echo "  Actions minutes. Actions bills per job, rounds each job up to the" | tee -a "$REPORT_FILE"
-        echo "  next whole minute, and applies multipliers (Windows 2x, macOS 10x)" | tee -a "$REPORT_FILE"
-        echo "  against Linux. Runner hardware also differs. Treat the figures" | tee -a "$REPORT_FILE"
-        echo "  above as the input to a modelled range, not a firm figure." | tee -a "$REPORT_FILE"
+        echo "SIZING CAVEAT: the minutes above are BUILD wall-clock time, which is" | tee -a "$REPORT_FILE"
+        echo "  not the unit per-job billing models charge on. Those bill per JOB" | tee -a "$REPORT_FILE"
+        echo "  and round each job up to a whole minute, so a build running" | tee -a "$REPORT_FILE"
+        echo "  four jobs in parallel bills roughly four times its wall-clock." | tee -a "$REPORT_FILE"
+        echo "  Multipliers then apply (Windows ${MULT_WINDOWS}x, macOS ${MULT_MACOS}x against Linux)." | tee -a "$REPORT_FILE"
+        echo "  Section 16 measures the job-level figure; section 17 measures the" | tee -a "$REPORT_FILE"
+        echo "  operating-system mix that drives the multiplier. Use those two" | tee -a "$REPORT_FILE"
+        echo "  sections for cost modelling, not the wall-clock total above." | tee -a "$REPORT_FILE"
     fi
 fi
 
@@ -1982,15 +2272,21 @@ while IFS= read -r pool_line; do
     pool_name=$(echo "$pool_line" | jq -r '.name')
     { [ -z "$pool_id" ] || [ "$pool_id" = "null" ]; } && continue
 
-    call_api_paged "$ORG_URL/_apis/distributedtask/pools/$pool_id/agents?api-version=$API_VERSION" '.value' \
-        | jq -c --arg pool "$pool_name" '{
-            pool: $pool,
-            name: (.name // "unknown"),
-            osDescription: (.osDescription // "unknown"),
-            enabled: (.enabled // false),
-            status: (.status // "unknown"),
-            version: (.version // null)
-          }' >> "$TEMP_DATA_DIR/agents.ndjson" 2>/dev/null
+    call_api_paged "$ORG_URL/_apis/distributedtask/pools/$pool_id/agents?includeCapabilities=true&api-version=$API_VERSION" '.value' \
+        | jq -c --arg pool "$pool_name" '
+            (.systemCapabilities // {}) as $c
+            | {
+                pool: $pool,
+                name: (.name // "unknown"),
+                osDescription: (.osDescription // "unknown"),
+                enabled: (.enabled // false),
+                status: (.status // "unknown"),
+                version: (.version // null),
+                cpuCount: (($c["NUMBER_OF_PROCESSORS"] // $c["Agent.CPUCount"] // null)
+                           | if . == null then null else (tonumber? // null) end),
+                osArch: ($c["Agent.OSArchitecture"] // null),
+                osVersion: ($c["Agent.OSVersion"] // null)
+              }' >> "$TEMP_DATA_DIR/agents.ndjson" 2>/dev/null
 done < <(jq -c '.[] | select(.isHosted != true)' "$POOLS_FILE" 2>/dev/null)
 
 ndjson_to_array "$TEMP_DATA_DIR/agents.ndjson" "$AGENTS_FILE"
@@ -1998,6 +2294,8 @@ ndjson_to_array "$TEMP_DATA_DIR/agents.ndjson" "$AGENTS_FILE"
 total_agents=$(jq 'length' "$AGENTS_FILE")
 online_agents=$(jq '[.[] | select(.status == "online")] | length' "$AGENTS_FILE")
 enabled_agents=$(jq '[.[] | select(.enabled == true)] | length' "$AGENTS_FILE")
+total_vcpu=0
+agents_with_cpu=0
 
 echo "" | tee -a "$REPORT_FILE"
 echo "Agent Pools: $total_pools total" | tee -a "$REPORT_FILE"
@@ -2028,28 +2326,61 @@ if [ "$total_agents" -gt 0 ]; then
            | sort_by(-.agents) | .[]
            | "  - \(.pool): \(.agents) agents (\(.online) online)"' \
         "$AGENTS_FILE" | tee -a "$REPORT_FILE"
+
+    # Agent size is what an equivalent hosted or self-hosted runner must match,
+    # and is the multiplier on the self-hosted infrastructure cost you supply
+    # from your own cloud or datacentre billing. Reported from agent-declared capabilities, which are only
+    # present for agents that have connected at least once.
+    agents_with_cpu=$(jq '[.[] | select(.cpuCount != null)] | length' "$AGENTS_FILE")
+    if [ "$agents_with_cpu" -gt 0 ]; then
+        total_vcpu=$(jq '[.[] | .cpuCount // 0] | add // 0' "$AGENTS_FILE")
+        echo "" | tee -a "$REPORT_FILE"
+        echo "Self-Hosted Agent Sizes (declared capabilities):" | tee -a "$REPORT_FILE"
+        echo "  Agents reporting CPU count: $agents_with_cpu of $total_agents" | tee -a "$REPORT_FILE"
+        echo "  Total vCPU across self-hosted fleet: $total_vcpu" | tee -a "$REPORT_FILE"
+        jq -r '[.[] | select(.cpuCount != null) | .cpuCount]
+               | group_by(.) | map({cpu: .[0], count: length}) | sort_by(.cpu) | .[]
+               | "  - \(.cpu) vCPU: \(.count) agents"' "$AGENTS_FILE" | tee -a "$REPORT_FILE"
+        echo "" | tee -a "$REPORT_FILE"
+        echo "  Use the vCPU total as the sizing basis, together with the per-VM" | tee -a "$REPORT_FILE"
+        echo "  or per-node cost of this fleet from your infrastructure billing." | tee -a "$REPORT_FILE"
+    else
+        total_vcpu=0
+        echo "" | tee -a "$REPORT_FILE"
+        echo "Self-Hosted Agent Sizes: not reported by the API for this account." | tee -a "$REPORT_FILE"
+        echo "  Agent capabilities require pool read permission. Re-run with an" | tee -a "$REPORT_FILE"
+        echo "  account that has it, or record the VM sizes behind these pools." | tee -a "$REPORT_FILE"
+    fi
 fi
 
 echo "" | tee -a "$REPORT_FILE"
-echo "GitHub equivalent: Microsoft-hosted pools map to GitHub-hosted runners" | tee -a "$REPORT_FILE"
-echo "  (per-minute billing). Self-hosted pools map to either self-hosted" | tee -a "$REPORT_FILE"
-echo "  runners or Actions Runner Controller (ARC) on Kubernetes - no GitHub" | tee -a "$REPORT_FILE"
-echo "  compute charge, but you keep the infrastructure cost." | tee -a "$REPORT_FILE"
-echo "  Peak concurrency (section 12) sizes the runner fleet; total minutes" | tee -a "$REPORT_FILE"
-echo "  size the GitHub-hosted spend." | tee -a "$REPORT_FILE"
+echo "Reading this for a platform comparison:" | tee -a "$REPORT_FILE"
+echo "  Microsoft-hosted pools are vendor-run compute, normally billed per" | tee -a "$REPORT_FILE"
+echo "  minute. Their usage carries over as metered spend on any hosted-runner" | tee -a "$REPORT_FILE"
+echo "  model. Self-hosted pools carry no vendor compute charge on either side," | tee -a "$REPORT_FILE"
+echo "  but the underlying infrastructure cost stays with you and does not" | tee -a "$REPORT_FILE"
+echo "  appear in any vendor quote." | tee -a "$REPORT_FILE"
+echo "  Peak concurrency (section 12) sizes the fleet; total minutes size the" | tee -a "$REPORT_FILE"
+echo "  hosted-compute portion." | tee -a "$REPORT_FILE"
 
 # ========================================
-# 14. ADO TO GITHUB CAPABILITY MAPPING
+# 14. INTEGRATION REPLACEMENT EFFORT
 # ========================================
-write_section "14. Azure DevOps to GitHub Capability Mapping"
+write_section "14. Integration Replacement Effort"
 
-echo "Mapping detected integrations to GitHub equivalents..." | tee -a "$REPORT_FILE"
+echo "Classifying each detected integration by how much work it would take to" | tee -a "$REPORT_FILE"
+echo "reproduce on a different CI platform." | tee -a "$REPORT_FILE"
 echo "" | tee -a "$REPORT_FILE"
 echo "Effort categories:" | tee -a "$REPORT_FILE"
-echo "  OOB     - supported out of the box by a GitHub feature" | tee -a "$REPORT_FILE"
-echo "  MARKET  - GitHub Marketplace action exists" | tee -a "$REPORT_FILE"
-echo "  PARTNER - publisher provides a supported GitHub App or action" | tee -a "$REPORT_FILE"
-echo "  CUSTOM  - no direct equivalent; expect bespoke work" | tee -a "$REPORT_FILE"
+echo "  OOB     - a native platform feature covers it; no integration work" | tee -a "$REPORT_FILE"
+echo "  MARKET  - an off-the-shelf marketplace component exists" | tee -a "$REPORT_FILE"
+echo "  PARTNER - the publisher ships and supports its own integration" | tee -a "$REPORT_FILE"
+echo "  CUSTOM  - no ready-made equivalent; expect bespoke work" | tee -a "$REPORT_FILE"
+echo "" | tee -a "$REPORT_FILE"
+echo "The category is the portable finding. The named component after each" | tee -a "$REPORT_FILE"
+echo "entry is a worked example against GitHub Actions, included to show why" | tee -a "$REPORT_FILE"
+echo "the item was graded that way - substitute the equivalent for whichever" | tee -a "$REPORT_FILE"
+echo "platform you are evaluating." | tee -a "$REPORT_FILE"
 echo "" | tee -a "$REPORT_FILE"
 
 map_service_connection() {
@@ -2149,7 +2480,7 @@ tally_category() {
 }
 
 if [ "${total_service_connections:-0}" -gt 0 ]; then
-    echo "Service Connection Mapping:" | tee -a "$REPORT_FILE"
+    echo "Service Connections:" | tee -a "$REPORT_FILE"
     while IFS='|' read -r conn_type conn_count; do
         [ -z "$conn_type" ] && continue
         mapping=$(map_service_connection "$conn_type")
@@ -2164,7 +2495,7 @@ if [ "${total_service_connections:-0}" -gt 0 ]; then
 fi
 
 if [ "${total_extensions:-0}" -gt 0 ]; then
-    echo "Marketplace Extension Mapping:" | tee -a "$REPORT_FILE"
+    echo "Marketplace Extensions:" | tee -a "$REPORT_FILE"
     while IFS= read -r ext_id; do
         [ -z "$ext_id" ] && continue
         mapping=$(map_extension "$(echo "$ext_id" | tr '[:upper:]' '[:lower:]')")
@@ -2183,8 +2514,8 @@ if [ "$total_mapped" -gt 0 ]; then
     echo "Integration Effort Summary (counted per distinct integration type," | tee -a "$REPORT_FILE"
     echo "not per instance - solving a type once covers all its instances):" | tee -a "$REPORT_FILE"
     echo "  Out of the box (no work):        $oob_count" | tee -a "$REPORT_FILE"
-    echo "  GitHub Marketplace action:       $market_count" | tee -a "$REPORT_FILE"
-    echo "  Partner / third-party action:    $partner_count" | tee -a "$REPORT_FILE"
+    echo "  Off-the-shelf component:         $market_count" | tee -a "$REPORT_FILE"
+    echo "  Publisher-supported integration: $partner_count" | tee -a "$REPORT_FILE"
     echo "  Custom build / needs assessment: $custom_count" | tee -a "$REPORT_FILE"
 
     if [ -s "$CUSTOM_ITEMS_FILE" ]; then
@@ -2238,6 +2569,1111 @@ echo "Use these denominators to compare in-house, partner, and managed" | tee -a
 echo "service options on the same basis." | tee -a "$REPORT_FILE"
 
 # ========================================
+# SECTION 16-22 COLLECTION DEFAULTS
+# ========================================
+# Every figure produced by sections 16-22 is initialised here so that a skipped
+# or permission-denied section still leaves the summary and the JSON export with
+# a defined, honest zero rather than an unset variable.
+timeline_stride=1
+timeline_is_sample=0
+timeline_target=0
+timeline_fetched=0
+timeline_failed=0
+timeline_sampled=0
+timeline_jobs=0
+avg_jobs_per_build=0
+job_expansion_ratio=0
+billable_job_minutes_window=0
+billable_job_minutes_month=0
+raw_job_minutes_month=0
+distinct_tasks_used=0
+ext_tasks_used=0
+jobreq_total=0
+jobreq_window_days=0
+os_multiplier_factor=0
+weighted_minutes_month=0
+total_deployments=0
+deployment_minutes_window=0
+deployment_minutes_month=0
+total_environments=0
+env_checks_checked=0
+env_approvals=0
+env_gates=0
+env_other_checks=0
+release_env_count=0
+release_manual_approvals=0
+release_gates=0
+total_secure_files=0
+complexity_observed=0
+complexity_simple=0
+complexity_moderate=0
+complexity_complex=0
+hosted_parallel_purchased=0
+hosted_parallel_used=0
+selfhosted_parallel_purchased=0
+selfhosted_parallel_used=0
+
+# ========================================
+# 16. JOB-LEVEL COMPUTE & BILLABLE MINUTES
+# ========================================
+write_section "16. Job-Level Compute & Billable Minutes (per-job billing model)"
+maybe_refresh_token
+
+# Section 12 measures BUILD wall-clock, which is what Azure DevOps reports.
+# GitHub Actions bills per JOB and rounds every job up to the next whole minute,
+# so a build that fans out to six parallel jobs bills roughly six times its
+# wall-clock duration. The build timeline is the only endpoint that exposes
+# job-level start and finish times, so it is the only way to produce a figure
+# that can be priced against Actions without guessing.
+#
+# One timeline call is needed per build. On a large estate that is too many
+# calls, so the collector samples evenly across the collected build history and
+# extrapolates using the measured job-to-wall-clock ratio. The sample size and
+# the ratio are both reported so the reader can judge the confidence.
+
+TIMELINE_RAW_NDJSON="$TEMP_DATA_DIR/timeline_raw.ndjson"
+TIMELINE_JOBS_FILE="$TEMP_DATA_DIR/timeline_jobs.json"
+TIMELINE_TASKS_FILE="$TEMP_DATA_DIR/timeline_tasks.json"
+TIMELINE_PERBUILD_FILE="$TEMP_DATA_DIR/timeline_perbuild.json"
+TIMELINE_STATS_FILE="$TEMP_DATA_DIR/timeline_stats.json"
+TIMELINE_OK_IDS="$TEMP_DATA_DIR/timeline_ok_ids.txt"
+TIMELINE_OK_BUILDS_FILE="$TEMP_DATA_DIR/timeline_ok_builds.json"
+SAMPLED_BUILDS_FILE="$TEMP_DATA_DIR/sampled_builds.json"
+ORG_TASKS_FILE="$TEMP_DATA_DIR/org_tasks.json"
+TASK_USAGE_FILE="$TEMP_DATA_DIR/task_usage.json"
+
+echo "{}" > "$TIMELINE_STATS_FILE"
+for _f in "$TIMELINE_JOBS_FILE" "$TIMELINE_TASKS_FILE" "$TIMELINE_PERBUILD_FILE" \
+          "$TIMELINE_OK_BUILDS_FILE" "$SAMPLED_BUILDS_FILE" "$ORG_TASKS_FILE" "$TASK_USAGE_FILE"; do
+    echo "[]" > "$_f"
+done
+unset _f
+: > "$TIMELINE_RAW_NDJSON"
+: > "$TIMELINE_OK_IDS"
+
+if [ "$SKIP_BUILD_HISTORY" = "1" ]; then
+    echo "Skipped: build history was not collected (SKIP_BUILD_HISTORY=1)." | tee -a "$REPORT_FILE"
+    echo "Job-level minutes require build history. Re-run without that flag to" | tee -a "$REPORT_FILE"
+    echo "produce a figure comparable to a per-job billing model." | tee -a "$REPORT_FILE"
+elif [ "$SKIP_TIMELINE" = "1" ]; then
+    echo "Skipped: SKIP_TIMELINE=1." | tee -a "$REPORT_FILE"
+    echo "Without this section the only compute figure available is build" | tee -a "$REPORT_FILE"
+    echo "wall-clock, which understates Actions billing on any parallel pipeline." | tee -a "$REPORT_FILE"
+elif [ "${total_builds:-0}" -eq 0 ]; then
+    echo "Skipped: no builds were found in the last $HISTORY_DAYS days." | tee -a "$REPORT_FILE"
+else
+    # Even sampling across the whole collected history. Because builds were
+    # collected project by project, taking every Nth record spreads the sample
+    # across every project in proportion to its build volume.
+    if [ "${total_builds:-0}" -le "$TIMELINE_SAMPLE_MAX" ]; then
+        timeline_stride=1
+        timeline_is_sample=0
+    else
+        timeline_stride=$(( (total_builds + TIMELINE_SAMPLE_MAX - 1) / TIMELINE_SAMPLE_MAX ))
+        timeline_is_sample=1
+    fi
+
+    jq -c --argjson stride "$timeline_stride" \
+        '[to_entries[] | select((.key % $stride) == 0) | .value | select(.id != null)]' \
+        "$BUILDS_FILE" > "$SAMPLED_BUILDS_FILE" 2>/dev/null || echo "[]" > "$SAMPLED_BUILDS_FILE"
+    timeline_target=$(num "$(jq 'length' "$SAMPLED_BUILDS_FILE" 2>/dev/null)")
+
+    if [ "$timeline_is_sample" = "1" ]; then
+        echo "Sampling every ${timeline_stride}th build: $timeline_target of ${total_builds} builds." | tee -a "$REPORT_FILE"
+        echo "Population figures below are extrapolated from this sample." | tee -a "$REPORT_FILE"
+    else
+        echo "Reading the timeline of all $timeline_target builds (no sampling)." | tee -a "$REPORT_FILE"
+    fi
+    echo "One API call per build - this is the slowest section." | tee -a "$REPORT_FILE"
+    echo "" | tee -a "$REPORT_FILE"
+
+    while IFS=$'\t' read -r s_project s_buildid s_defid; do
+        [ -z "$s_project" ] && continue
+        case "$s_buildid" in ''|*[!0-9]*) continue ;; esac
+        s_defid=$(num "$s_defid")
+
+        timeline_fetched=$((timeline_fetched + 1))
+        if [ $((timeline_fetched % 200)) -eq 0 ]; then
+            maybe_refresh_token
+            echo "  ... $timeline_fetched of $timeline_target timelines read"
+        fi
+
+        s_project_enc=$(url_encode "$s_project")
+        timeline_body=$(call_api "$ORG_URL/$s_project_enc/_apis/build/builds/$s_buildid/timeline?api-version=$API_VERSION")
+
+        if [ "$timeline_body" = "API_ERROR" ] || ! echo "$timeline_body" | jq empty 2>/dev/null; then
+            timeline_failed=$((timeline_failed + 1))
+            continue
+        fi
+
+        echo "$s_buildid" >> "$TIMELINE_OK_IDS"
+
+        # Jobs carry the billable duration; tasks identify which marketplace and
+        # custom tasks are genuinely executed, as opposed to merely installed.
+        echo "$timeline_body" | jq -c \
+            --arg proj "$s_project" \
+            --argjson bid "$s_buildid" \
+            --argjson did "$s_defid" '
+            (.records // []) as $r
+            | ($r[] | select(.type == "Job")
+               | {k: "job", project: $proj, buildId: $bid, definitionId: $did,
+                  name: (.name // ""), worker: (.workerName // null),
+                  s: (.startTime // null), f: (.finishTime // null),
+                  result: (.result // "unknown")}),
+              ($r[] | select(.type == "Task")
+               | {k: "task", project: $proj, buildId: $bid, definitionId: $did,
+                  taskId: (.task.id // null),
+                  taskName: (.task.name // .name // "unknown")})
+            ' >> "$TIMELINE_RAW_NDJSON" 2>/dev/null
+    done < <(jq -r '.[] | [.project, (.id | tostring), ((.definitionId // 0) | tostring)] | @tsv' \
+                "$SAMPLED_BUILDS_FILE" 2>/dev/null)
+
+    if [ "$timeline_failed" -gt 0 ]; then
+        report_warn "$timeline_failed of $timeline_target build timelines could not be read - job-level minutes are based on the remainder."
+    fi
+
+    if [ -s "$TIMELINE_RAW_NDJSON" ]; then
+        jq -s '[.[] | select(.k == "job")]' "$TIMELINE_RAW_NDJSON" \
+            > "$TIMELINE_JOBS_FILE" 2>/dev/null || echo "[]" > "$TIMELINE_JOBS_FILE"
+        jq -s '[.[] | select(.k == "task")]' "$TIMELINE_RAW_NDJSON" \
+            > "$TIMELINE_TASKS_FILE" 2>/dev/null || echo "[]" > "$TIMELINE_TASKS_FILE"
+    fi
+
+    # The wall-clock denominator must cover exactly the builds whose timeline was
+    # actually read, otherwise the ratio is computed against builds with no jobs.
+    jq -c --slurpfile ok <(jq -R -s 'split("\n") | map(select(length > 0) | tonumber? // empty)' \
+                              "$TIMELINE_OK_IDS" 2>/dev/null || echo '[]') \
+        '[ .[] | select(.id as $i | (($ok[0] // []) | index($i)) != null) ]' \
+        "$SAMPLED_BUILDS_FILE" > "$TIMELINE_OK_BUILDS_FILE" 2>/dev/null \
+        || echo "[]" > "$TIMELINE_OK_BUILDS_FILE"
+
+    jq -n \
+        --slurpfile jobs "$TIMELINE_JOBS_FILE" \
+        --slurpfile okb "$TIMELINE_OK_BUILDS_FILE" \
+        --argjson windowDays "$(num "${HISTORY_DAYS:-90}")" \
+        --argjson populationMinutes "$(num "${total_build_minutes:-0}")" '
+        def epoch:
+            if (. == null or . == "") then null
+            else (sub("\\.[0-9]+";"") | fromdateiso8601? // null) end;
+
+        (($jobs[0] // [])
+         | map(. + {_s: (.s | epoch), _f: (.f | epoch)})
+         | map(select(._s != null and ._f != null and ._f >= ._s))
+         | map(. + {_d: (._f - ._s)})) as $j
+        | (($okb[0] // [])
+           | map(. + {_s: (.startTime | epoch), _f: (.finishTime | epoch)})
+           | map(select(._s != null and ._f != null and ._f >= ._s))
+           | map(._f - ._s)) as $bd
+        | ($bd | add // 0) as $buildSec
+        | ($j | map(._d) | add // 0) as $jobSec
+        # Actions rounds every job up to a whole minute, with a one-minute floor.
+        | ($j | map(if ._d < 60 then 1 else ((._d + 59) / 60 | floor) end) | add // 0) as $billable
+        | (($okb[0] // []) | length) as $sampleBuilds
+        | (if $buildSec > 0 then (($jobSec / $buildSec) * 1000 | floor) / 1000 else 0 end) as $rawRatio
+        | (if $buildSec > 0 then ((($billable * 60) / $buildSec) * 1000 | floor) / 1000 else 0 end) as $billRatio
+        | {
+            sampleBuilds: $sampleBuilds,
+            sampleJobs: ($j | length),
+            sampleBuildWallClockMinutes: (($buildSec / 60) | floor),
+            sampleRawJobMinutes: (($jobSec / 60) | floor),
+            sampleBillableJobMinutes: $billable,
+            avgJobsPerBuild:
+                (if $sampleBuilds > 0
+                 then (((($j | length) / $sampleBuilds) * 100) | floor) / 100 else 0 end),
+            avgJobMinutes:
+                (if ($j | length) > 0
+                 then ((($jobSec / ($j | length) / 60) * 100) | floor) / 100 else 0 end),
+            rawJobToWallClockRatio: $rawRatio,
+            billableToWallClockRatio: $billRatio,
+            estimatedBillableJobMinutesWindow: (($populationMinutes * $billRatio) | floor),
+            estimatedBillableJobMinutesPerMonth:
+                (((($populationMinutes * $billRatio) / $windowDays) * 30) | floor),
+            estimatedRawJobMinutesPerMonth:
+                (((($populationMinutes * $rawRatio) / $windowDays) * 30) | floor),
+            jobResultBreakdown:
+                ($j | group_by(.result)
+                    | map({key: (.[0].result // "unknown"), count: length})
+                    | sort_by(-.count))
+          }' > "$TIMELINE_STATS_FILE" 2>/dev/null
+
+    if [ ! -s "$TIMELINE_STATS_FILE" ]; then
+        echo "{}" > "$TIMELINE_STATS_FILE"
+        report_warn "Job-level statistics could not be computed from the collected timelines."
+    fi
+
+    timeline_sampled=$(num "$(jq -r '.sampleBuilds // 0' "$TIMELINE_STATS_FILE")")
+    timeline_jobs=$(num "$(jq -r '.sampleJobs // 0' "$TIMELINE_STATS_FILE")")
+    avg_jobs_per_build=$(jq -r '.avgJobsPerBuild // 0' "$TIMELINE_STATS_FILE")
+    job_expansion_ratio=$(jq -r '.billableToWallClockRatio // 0' "$TIMELINE_STATS_FILE")
+    billable_job_minutes_window=$(num "$(jq -r '.estimatedBillableJobMinutesWindow // 0' "$TIMELINE_STATS_FILE")")
+    billable_job_minutes_month=$(num "$(jq -r '.estimatedBillableJobMinutesPerMonth // 0' "$TIMELINE_STATS_FILE")")
+    raw_job_minutes_month=$(num "$(jq -r '.estimatedRawJobMinutesPerMonth // 0' "$TIMELINE_STATS_FILE")")
+
+    echo "Sample:" | tee -a "$REPORT_FILE"
+    echo "  Builds with a readable timeline: $timeline_sampled" | tee -a "$REPORT_FILE"
+    echo "  Jobs observed:                   $timeline_jobs" | tee -a "$REPORT_FILE"
+    echo "  Average jobs per build:          $avg_jobs_per_build" | tee -a "$REPORT_FILE"
+    echo "  Average job duration (min):      $(jq -r '.avgJobMinutes // 0' "$TIMELINE_STATS_FILE")" | tee -a "$REPORT_FILE"
+    echo "" | tee -a "$REPORT_FILE"
+    echo "Measured in the sample:" | tee -a "$REPORT_FILE"
+    echo "  Build wall-clock minutes:        $(jq -r '.sampleBuildWallClockMinutes // 0' "$TIMELINE_STATS_FILE")" | tee -a "$REPORT_FILE"
+    echo "  Raw job minutes:                 $(jq -r '.sampleRawJobMinutes // 0' "$TIMELINE_STATS_FILE")" | tee -a "$REPORT_FILE"
+    echo "  Billable job minutes (rounded):  $(jq -r '.sampleBillableJobMinutes // 0' "$TIMELINE_STATS_FILE")" | tee -a "$REPORT_FILE"
+    echo "" | tee -a "$REPORT_FILE"
+    echo "Expansion ratio (billable job minutes per build wall-clock minute): $job_expansion_ratio" | tee -a "$REPORT_FILE"
+    echo "  A ratio above 1.0 means parallel jobs and per-job rounding make the" | tee -a "$REPORT_FILE"
+    echo "  Actions-billable figure larger than the Azure DevOps minute count." | tee -a "$REPORT_FILE"
+    echo "" | tee -a "$REPORT_FILE"
+    echo "APPLIED TO THE FULL ESTATE:" | tee -a "$REPORT_FILE"
+    echo "  Billable job minutes (${HISTORY_DAYS}d): $billable_job_minutes_window" | tee -a "$REPORT_FILE"
+    echo "  Billable job minutes per month:  $billable_job_minutes_month" | tee -a "$REPORT_FILE"
+    if [ "$timeline_is_sample" = "1" ]; then
+        echo "  Basis: EXTRAPOLATED from $timeline_sampled sampled builds" | tee -a "$REPORT_FILE"
+    else
+        echo "  Basis: MEASURED across every build in the window" | tee -a "$REPORT_FILE"
+    fi
+    echo "" | tee -a "$REPORT_FILE"
+    echo "This is the measurement a cost model needs. Whoever prepares the" | tee -a "$REPORT_FILE"
+    echo "estimate applies current runner rates to it, after weighting by the" | tee -a "$REPORT_FILE"
+    echo "operating-system mix in section 17 and removing any workload that" | tee -a "$REPORT_FILE"
+    echo "would stay on self-hosted runners." | tee -a "$REPORT_FILE"
+
+    # ---- Executed task inventory -------------------------------------------
+    # The extensions list in section 10 shows what is installed. This shows what
+    # actually runs, which is the set that has to be replaced in Actions.
+    maybe_refresh_token
+    call_api_paged "$ORG_URL/_apis/distributedtask/tasks?api-version=7.1-preview.1" '.value' \
+        | jq -c '{id: (.id // null), name: (.name // "unknown"),
+                  contributionIdentifier: (.contributionIdentifier // null)}' \
+        > "$TEMP_DATA_DIR/org_tasks.ndjson" 2>/dev/null
+    ndjson_to_array "$TEMP_DATA_DIR/org_tasks.ndjson" "$ORG_TASKS_FILE"
+
+    jq -n --slurpfile tasks "$TIMELINE_TASKS_FILE" --slurpfile catalog "$ORG_TASKS_FILE" '
+        ((($catalog[0] // []) | map(select(.id != null))
+          | group_by(.id) | map({key: .[0].id, value: .[0]}) | from_entries)) as $cat
+        | (($tasks[0] // [])
+           | group_by((.taskId // "") + "|" + (.taskName // "unknown"))
+           | map({
+               taskId: (.[0].taskId),
+               name: (.[0].taskName // "unknown"),
+               executions: length,
+               pipelines: ([.[].definitionId] | unique | length),
+               extension: (($cat[(.[0].taskId // "")] // {}) | .contributionIdentifier)
+             })
+           | sort_by(-.executions))' > "$TASK_USAGE_FILE" 2>/dev/null \
+        || echo "[]" > "$TASK_USAGE_FILE"
+
+    distinct_tasks_used=$(num "$(jq 'length' "$TASK_USAGE_FILE" 2>/dev/null)")
+    ext_tasks_used=$(num "$(jq '[.[] | select(.extension != null)] | length' "$TASK_USAGE_FILE" 2>/dev/null)")
+
+    if [ "$distinct_tasks_used" -gt 0 ]; then
+        echo "" | tee -a "$REPORT_FILE"
+        echo "Tasks Actually Executed (from the sampled builds):" | tee -a "$REPORT_FILE"
+        echo "  Distinct tasks in use:                 $distinct_tasks_used" | tee -a "$REPORT_FILE"
+        echo "  Provided by a Marketplace extension:   $ext_tasks_used" | tee -a "$REPORT_FILE"
+        echo "" | tee -a "$REPORT_FILE"
+        echo "  Top 20 tasks by execution count:" | tee -a "$REPORT_FILE"
+        jq -r '.[:20][] | "    - \(.name): \(.executions) runs across \(.pipelines) pipelines\(if .extension != null then "  [extension: \(.extension)]" else "" end)"' \
+            "$TASK_USAGE_FILE" | tee -a "$REPORT_FILE"
+
+        if [ "$ext_tasks_used" -gt 0 ]; then
+            echo "" | tee -a "$REPORT_FILE"
+            echo "  Extension-provided tasks in use (each needs an Actions equivalent):" | tee -a "$REPORT_FILE"
+            jq -r '[.[] | select(.extension != null)]
+                   | group_by(.extension)
+                   | map({extension: .[0].extension,
+                          tasks: length,
+                          executions: ([.[].executions] | add // 0)})
+                   | sort_by(-.executions) | .[]
+                   | "    - \(.extension): \(.tasks) task(s), \(.executions) executions"' \
+                "$TASK_USAGE_FILE" | tee -a "$REPORT_FILE"
+        fi
+    fi
+
+    # ---- Per-build rollup, consumed by the complexity section ---------------
+    jq -n --slurpfile jobs "$TIMELINE_JOBS_FILE" \
+          --slurpfile tasks "$TIMELINE_TASKS_FILE" \
+          --slurpfile usage "$TASK_USAGE_FILE" '
+        ((($usage[0] // []) | map(select(.extension != null) | .taskId)
+          | map(select(. != null)))) as $extIds
+        | (($jobs[0] // []) | group_by(.buildId)
+           | map({buildId: .[0].buildId, definitionId: .[0].definitionId,
+                  project: .[0].project, jobs: length})) as $jb
+        | (($tasks[0] // []) | group_by(.buildId)
+           | map({buildId: .[0].buildId,
+                  tasks: length,
+                  distinctTasks: ([.[].taskId] | unique | length),
+                  extTasks: ([.[] | select((.taskId as $t | $extIds | index($t)) != null) | .taskId]
+                             | unique | length)})
+           | map({key: (.buildId | tostring), value: .}) | from_entries) as $tmap
+        | $jb | map(. + (($tmap[(.buildId | tostring)] // {})
+                         | {tasks: (.tasks // 0),
+                            distinctTasks: (.distinctTasks // 0),
+                            extTasks: (.extTasks // 0)}))' \
+        > "$TIMELINE_PERBUILD_FILE" 2>/dev/null || echo "[]" > "$TIMELINE_PERBUILD_FILE"
+fi
+
+# ========================================
+# 17. RUNNER IMAGE & OPERATING SYSTEM MIX
+# ========================================
+write_section "17. Runner Image & Operating System Mix"
+maybe_refresh_token
+
+# Total minutes alone cannot be priced: per-job models weight Linux at 1x,
+# Windows at 2x and macOS at 10x. The agent job-request queue is the only
+# endpoint that reports the image each job actually ran on, so it is the only
+# source for the multiplier weighting.
+#
+# Azure DevOps keeps a limited history of job requests, and does not document
+# how much. The observed window is therefore measured from the data returned
+# and reported alongside the mix, so a short retention is visible rather than
+# silently treated as a full-period sample.
+
+JOBREQ_FILE="$TEMP_DATA_DIR/jobrequests.json"
+JOBREQ_STATS_FILE="$TEMP_DATA_DIR/jobrequest_stats.json"
+echo "[]" > "$JOBREQ_FILE"
+echo "{}" > "$JOBREQ_STATS_FILE"
+rm -f "$TEMP_DATA_DIR/jobrequests.ndjson"
+touch "$TEMP_DATA_DIR/jobrequests.ndjson"
+
+while IFS= read -r pool_line; do
+    [ -z "$pool_line" ] && continue
+    jr_pool_id=$(echo "$pool_line" | jq -r '.id // empty')
+    jr_pool_name=$(echo "$pool_line" | jq -r '.name // "unknown"')
+    jr_pool_hosted=$(echo "$pool_line" | jq -r 'if (.isHosted == true) then "true" else "false" end')
+    [ -z "$jr_pool_id" ] && continue
+
+    jr_body=$(call_api "$ORG_URL/_apis/distributedtask/pools/$jr_pool_id/jobrequests?api-version=7.1-preview.1")
+    [ "$jr_body" = "API_ERROR" ] && continue
+    echo "$jr_body" | jq empty 2>/dev/null || continue
+
+    echo "$jr_body" | jq -c --arg pool "$jr_pool_name" --argjson hosted "$jr_pool_hosted" '
+        .value[]? | {
+            pool: $pool,
+            hosted: $hosted,
+            image: (.agentSpecification.vmImage // .agentSpecification.identifier // null),
+            demands: ((.demands // []) | map(tostring) | join(";")),
+            queueTime: (.queueTime // null),
+            assignTime: (.assignTime // null),
+            finishTime: (.finishTime // null),
+            result: (.result // "unknown"),
+            definition: (.definition.name // null)
+        }' >> "$TEMP_DATA_DIR/jobrequests.ndjson" 2>/dev/null
+done < <(jq -c '.[]' "$POOLS_FILE" 2>/dev/null)
+
+ndjson_to_array "$TEMP_DATA_DIR/jobrequests.ndjson" "$JOBREQ_FILE"
+jobreq_total=$(num "$(jq 'length' "$JOBREQ_FILE" 2>/dev/null)")
+
+if [ "$jobreq_total" -eq 0 ]; then
+    echo "No agent job requests were returned." | tee -a "$REPORT_FILE"
+    echo "" | tee -a "$REPORT_FILE"
+    echo "The operating-system mix of hosted minutes could not be measured." | tee -a "$REPORT_FILE"
+    echo "This is the single largest cost variable, because Windows bills at ${MULT_WINDOWS}x" | tee -a "$REPORT_FILE"
+    echo "and macOS at ${MULT_MACOS}x Linux. Record the Windows, Linux and macOS split from" | tee -a "$REPORT_FILE"
+    echo "your pipeline definitions, or grant pool read permission and re-run." | tee -a "$REPORT_FILE"
+    report_warn "Agent job requests returned no data - the OS mix behind hosted minutes is UNKNOWN and must be established another way."
+else
+    jq '
+        def epoch:
+            if (. == null or . == "") then null
+            else (sub("\\.[0-9]+";"") | fromdateiso8601? // null) end;
+        def osfam($s):
+            if ($s == null or $s == "") then "Unknown"
+            elif ($s | test("(?i)windows|win-|win2|windows_nt|vs2017|vs2019")) then "Windows"
+            elif ($s | test("(?i)macos|mac-|osx|darwin")) then "macOS"
+            elif ($s | test("(?i)ubuntu|linux|debian|rhel|centos|fedora|alpine|suse")) then "Linux"
+            else "Unknown" end;
+
+        map(. + {_img: (if (.image != null and .image != "") then .image else .demands end)})
+        | map(. + {os: osfam(._img),
+                   _q: (.queueTime | epoch),
+                   _a: (.assignTime | epoch),
+                   _f: (.finishTime | epoch)})
+        | map(. + {_start: (._a // ._q)})
+        | map(. + {_d: (if (._start != null and ._f != null and ._f >= ._start)
+                        then (._f - ._start) else null end)})
+        | . as $r
+        | {
+            requests: ($r | length),
+            withTiming: ($r | map(select(._d != null)) | length),
+            observedFrom: ($r | map(._q) | map(select(. != null))
+                           | (if length == 0 then null else (min | todate) end)),
+            observedTo: ($r | map(._f) | map(select(. != null))
+                         | (if length == 0 then null else (max | todate) end)),
+            byOs: ($r | group_by(.os)
+                   | map({
+                       os: .[0].os,
+                       requests: length,
+                       minutes: (((map(select(._d != null) | ._d) | add // 0) / 60) | floor),
+                       billableMinutes:
+                           (map(select(._d != null)
+                                | (if ._d < 60 then 1 else ((._d + 59) / 60 | floor) end))
+                            | add // 0)
+                     })
+                   | sort_by(-.billableMinutes)),
+            byImage: ($r | group_by(._img // "unspecified")
+                      | map({
+                          image: (.[0]._img // "unspecified"),
+                          hosted: (.[0].hosted),
+                          requests: length,
+                          minutes: (((map(select(._d != null) | ._d) | add // 0) / 60) | floor)
+                        })
+                      | sort_by(-.minutes) | .[:15]),
+            byHosted: ($r | group_by(.hosted)
+                       | map({
+                           hosted: .[0].hosted,
+                           requests: length,
+                           minutes: (((map(select(._d != null) | ._d) | add // 0) / 60) | floor)
+                         }))
+          }' "$JOBREQ_FILE" > "$JOBREQ_STATS_FILE" 2>/dev/null
+
+    [ -s "$JOBREQ_STATS_FILE" ] || echo "{}" > "$JOBREQ_STATS_FILE"
+
+    jr_from=$(jq -r '.observedFrom // "unknown"' "$JOBREQ_STATS_FILE")
+    jr_to=$(jq -r '.observedTo // "unknown"' "$JOBREQ_STATS_FILE")
+    jobreq_window_days=$(jq -rn --slurpfile s "$JOBREQ_STATS_FILE" '
+        ($s[0].observedFrom // null) as $a | ($s[0].observedTo // null) as $b
+        | if ($a == null or $b == null) then 0
+          else ((($b | fromdateiso8601) - ($a | fromdateiso8601)) / 86400 * 10 | floor) / 10 end' 2>/dev/null)
+    jobreq_window_days=${jobreq_window_days:-0}
+
+    echo "Job requests returned: $jobreq_total" | tee -a "$REPORT_FILE"
+    echo "Observed window:       $jr_from  ->  $jr_to  (${jobreq_window_days} days)" | tee -a "$REPORT_FILE"
+    echo "" | tee -a "$REPORT_FILE"
+    echo "IMPORTANT: Azure DevOps retains job requests for a limited, undocumented" | tee -a "$REPORT_FILE"
+    echo "  period. Treat the window above as the true coverage of this section." | tee -a "$REPORT_FILE"
+    echo "  If it is materially shorter than the ${HISTORY_DAYS}-day build window," | tee -a "$REPORT_FILE"
+    echo "  use the MIX below as a proportion and apply it to the job minutes in" | tee -a "$REPORT_FILE"
+    echo "  section 16 - do not use these absolute minutes as a monthly total." | tee -a "$REPORT_FILE"
+
+    echo "" | tee -a "$REPORT_FILE"
+    echo "Operating System Mix (the Actions cost multiplier):" | tee -a "$REPORT_FILE"
+    jq -r '
+        (.byOs // []) as $o
+        | ($o | map(.billableMinutes) | add // 0) as $t
+        | $o[]
+        | "  - \(.os): \(.requests) jobs, \(.minutes) min, \(.billableMinutes) billable min"
+          + (if $t > 0 then "  (\((.billableMinutes / $t * 1000 | floor) / 10)% of billable)" else "" end)
+        ' "$JOBREQ_STATS_FILE" | tee -a "$REPORT_FILE"
+
+    # Weighted factor: how many Linux-equivalent minutes one billable minute of
+    # this workload costs, given the observed mix.
+    os_multiplier_factor=$(jq -rn --slurpfile s "$JOBREQ_STATS_FILE" \
+        --argjson ml "$(numf "$MULT_LINUX")" \
+        --argjson mw "$(numf "$MULT_WINDOWS")" \
+        --argjson mm "$(numf "$MULT_MACOS")" '
+        (($s[0].byOs // [])
+         | map(. + {mult: (if .os == "Windows" then $mw
+                           elif .os == "macOS" then $mm
+                           else $ml end)})) as $o
+        | ($o | map(.billableMinutes) | add // 0) as $t
+        | if $t > 0
+          then ((($o | map(.billableMinutes * .mult) | add // 0) / $t) * 100 | floor) / 100
+          else 0 end' 2>/dev/null)
+    os_multiplier_factor=${os_multiplier_factor:-0}
+
+    echo "" | tee -a "$REPORT_FILE"
+    echo "Weighted multiplier for this mix: ${os_multiplier_factor}x" | tee -a "$REPORT_FILE"
+    echo "  (Linux ${MULT_LINUX}x, Windows ${MULT_WINDOWS}x, macOS ${MULT_MACOS}x. A figure of 1.00 means an" | tee -a "$REPORT_FILE"
+    echo "  all-Linux estate; anything higher is the premium the current mix" | tee -a "$REPORT_FILE"
+    echo "  carries. Confirm these ratios against current published rates.)" | tee -a "$REPORT_FILE"
+
+    echo "" | tee -a "$REPORT_FILE"
+    echo "Hosted vs Self-Hosted (by job request):" | tee -a "$REPORT_FILE"
+    jq -r '(.byHosted // [])[]
+           | "  - \(if .hosted then "Microsoft-hosted" else "self-hosted" end): \(.requests) jobs, \(.minutes) min"' \
+        "$JOBREQ_STATS_FILE" | tee -a "$REPORT_FILE"
+
+    echo "" | tee -a "$REPORT_FILE"
+    echo "Top Images / Demands:" | tee -a "$REPORT_FILE"
+    jq -r '(.byImage // [])[] | "  - \(.image): \(.requests) jobs, \(.minutes) min"' \
+        "$JOBREQ_STATS_FILE" | tee -a "$REPORT_FILE"
+fi
+
+# ========================================
+# 18. DEPLOYMENT (RELEASE) COMPUTE
+# ========================================
+write_section "18. Deployment (Release) Compute"
+maybe_refresh_token
+
+# Build history covers pipelines only. Classic release pipelines run on the same
+# agents and consume the same parallel jobs, but are invisible to the build API.
+# Omitting them understates the compute that has to be replaced in Actions.
+
+DEPLOY_FILE="$TEMP_DATA_DIR/deployments.json"
+DEPLOY_STATS_FILE="$TEMP_DATA_DIR/deployment_stats.json"
+echo "[]" > "$DEPLOY_FILE"
+echo "{}" > "$DEPLOY_STATS_FILE"
+rm -f "$TEMP_DATA_DIR/deployments.ndjson"
+touch "$TEMP_DATA_DIR/deployments.ndjson"
+
+if [ "${total_release_defs:-0}" -eq 0 ]; then
+    echo "No classic release pipelines were found, so there is no separate" | tee -a "$REPORT_FILE"
+    echo "deployment compute to account for." | tee -a "$REPORT_FILE"
+else
+    echo "Collecting deployments since $HISTORY_START..." | tee -a "$REPORT_FILE"
+    for project in "${projects[@]}"; do
+        [ -z "$project" ] && continue
+        maybe_refresh_token
+        project_encoded=$(url_encode "$project")
+        call_api_paged \
+            "https://vsrm.dev.azure.com/$ORG/$project_encoded/_apis/release/deployments?minStartedTime=$HISTORY_START&api-version=$API_VERSION" \
+            '.value' \
+            | jq -c --arg proj "$project" '{
+                project: $proj,
+                startedOn: (.startedOn // null),
+                completedOn: (.completedOn // null),
+                status: (.deploymentStatus // "unknown"),
+                environment: (.releaseEnvironment.name // "unknown"),
+                definition: (.releaseDefinition.name // "unknown")
+              }' >> "$TEMP_DATA_DIR/deployments.ndjson" 2>/dev/null
+    done
+
+    ndjson_to_array "$TEMP_DATA_DIR/deployments.ndjson" "$DEPLOY_FILE"
+    total_deployments=$(num "$(jq 'length' "$DEPLOY_FILE" 2>/dev/null)")
+
+    if [ "$total_deployments" -eq 0 ]; then
+        echo "No deployments were returned for the window." | tee -a "$REPORT_FILE"
+    else
+        jq --argjson days "$(num "${HISTORY_DAYS:-90}")" '
+            def epoch:
+                if (. == null or . == "") then null
+                else (sub("\\.[0-9]+";"") | fromdateiso8601? // null) end;
+            map(. + {_s: (.startedOn | epoch), _f: (.completedOn | epoch)})
+            | map(. + {_d: (if (._s != null and ._f != null and ._f >= ._s)
+                            then (._f - ._s) else null end)})
+            | . as $d
+            | ($d | map(select(._d != null) | ._d) | add // 0) as $sec
+            | {
+                deployments: ($d | length),
+                windowDays: $days,
+                minutesInWindow: (($sec / 60) | floor),
+                minutesPerMonth: ((($sec / 60) / $days * 30) | floor),
+                deploymentsPerMonth: ((($d | length) / $days * 30) | floor),
+                byStatus: ($d | group_by(.status)
+                           | map({status: .[0].status, count: length})
+                           | sort_by(-.count)),
+                topEnvironments: ($d | group_by(.environment)
+                                  | map({environment: .[0].environment,
+                                         deployments: length,
+                                         minutes: (((map(select(._d != null) | ._d) | add // 0) / 60) | floor)})
+                                  | sort_by(-.minutes) | .[:10])
+              }' "$DEPLOY_FILE" > "$DEPLOY_STATS_FILE" 2>/dev/null
+
+        [ -s "$DEPLOY_STATS_FILE" ] || echo "{}" > "$DEPLOY_STATS_FILE"
+
+        deployment_minutes_window=$(num "$(jq -r '.minutesInWindow // 0' "$DEPLOY_STATS_FILE")")
+        deployment_minutes_month=$(num "$(jq -r '.minutesPerMonth // 0' "$DEPLOY_STATS_FILE")")
+
+        echo "" | tee -a "$REPORT_FILE"
+        echo "Deployments in last $HISTORY_DAYS days: $total_deployments" | tee -a "$REPORT_FILE"
+        echo "Deployments per month:                 $(jq -r '.deploymentsPerMonth // 0' "$DEPLOY_STATS_FILE")" | tee -a "$REPORT_FILE"
+        echo "Deployment minutes ($HISTORY_DAYS days):  $deployment_minutes_window" | tee -a "$REPORT_FILE"
+        echo "Deployment minutes per month:          $deployment_minutes_month" | tee -a "$REPORT_FILE"
+        echo "" | tee -a "$REPORT_FILE"
+        echo "Outcomes:" | tee -a "$REPORT_FILE"
+        jq -r '(.byStatus // [])[] | "  - \(.status): \(.count)"' "$DEPLOY_STATS_FILE" | tee -a "$REPORT_FILE"
+        echo "" | tee -a "$REPORT_FILE"
+        echo "Busiest Environments:" | tee -a "$REPORT_FILE"
+        jq -r '(.topEnvironments // [])[] | "  - \(.environment): \(.deployments) deployments, \(.minutes) min"' \
+            "$DEPLOY_STATS_FILE" | tee -a "$REPORT_FILE"
+        echo "" | tee -a "$REPORT_FILE"
+        echo "These minutes are ADDITIONAL to the build minutes in section 12 and" | tee -a "$REPORT_FILE"
+        echo "must be included in the Actions compute estimate." | tee -a "$REPORT_FILE"
+    fi
+fi
+
+# ========================================
+# 19. APPROVALS, GATES, ENVIRONMENTS & SECRETS
+# ========================================
+write_section "19. Approvals, Gates, Environments & Secrets"
+maybe_refresh_token
+
+# None of these migrate automatically. Each approval, gate, secret and secure
+# file is manual re-implementation effort in Actions, so the counts are a direct
+# input to the one-off migration effort rather than the ongoing run-rate.
+
+ENVIRONMENTS_FILE="$TEMP_DATA_DIR/environments.json"
+CHECKS_FILE="$TEMP_DATA_DIR/checks.json"
+SECUREFILES_FILE="$TEMP_DATA_DIR/securefiles.json"
+RELEASE_APPROVALS_FILE="$TEMP_DATA_DIR/release_approvals.json"
+MAX_ENV_CHECK_LOOKUPS=300
+
+rm -f "$TEMP_DATA_DIR"/environments.ndjson "$TEMP_DATA_DIR"/checks.ndjson \
+      "$TEMP_DATA_DIR"/securefiles.ndjson "$TEMP_DATA_DIR"/release_approvals.ndjson
+touch "$TEMP_DATA_DIR"/environments.ndjson "$TEMP_DATA_DIR"/checks.ndjson \
+      "$TEMP_DATA_DIR"/securefiles.ndjson "$TEMP_DATA_DIR"/release_approvals.ndjson
+
+for project in "${projects[@]}"; do
+    [ -z "$project" ] && continue
+    maybe_refresh_token
+    project_encoded=$(url_encode "$project")
+
+    call_api_paged \
+        "$ORG_URL/$project_encoded/_apis/distributedtask/environments?api-version=7.1-preview.1" \
+        '.value' \
+        | jq -c --arg proj "$project" '{project: $proj, id: (.id // null), name: (.name // "unknown")}' \
+        >> "$TEMP_DATA_DIR/environments.ndjson" 2>/dev/null
+
+    call_api_paged \
+        "$ORG_URL/$project_encoded/_apis/distributedtask/securefiles?api-version=7.1-preview.1" \
+        '.value' \
+        | jq -c --arg proj "$project" '{project: $proj, name: (.name // "unknown")}' \
+        >> "$TEMP_DATA_DIR/securefiles.ndjson" 2>/dev/null
+
+    # Classic release approvals and gates. $expand=environments returns the
+    # approval and gate configuration inline, avoiding a call per definition.
+    call_api_paged \
+        "https://vsrm.dev.azure.com/$ORG/$project_encoded/_apis/release/definitions?%24expand=environments&api-version=$API_VERSION" \
+        '.value' \
+        | jq -c --arg proj "$project" '{
+            project: $proj,
+            name: (.name // "unknown"),
+            environments: ((.environments // []) | length),
+            manualApprovals: ([(.environments // [])[]
+                | select((((.preDeployApprovals.approvals // [])
+                           + (.postDeployApprovals.approvals // []))
+                          | map(select(.isAutomated == false)) | length) > 0)]
+                | length),
+            gates: ([(.environments // [])[]
+                | select((((.preDeploymentGates.gates // [])
+                           + (.postDeploymentGates.gates // [])) | length) > 0)]
+                | length)
+          }' >> "$TEMP_DATA_DIR/release_approvals.ndjson" 2>/dev/null
+done
+
+ndjson_to_array "$TEMP_DATA_DIR/environments.ndjson" "$ENVIRONMENTS_FILE"
+ndjson_to_array "$TEMP_DATA_DIR/securefiles.ndjson" "$SECUREFILES_FILE"
+ndjson_to_array "$TEMP_DATA_DIR/release_approvals.ndjson" "$RELEASE_APPROVALS_FILE"
+
+total_environments=$(num "$(jq 'length' "$ENVIRONMENTS_FILE" 2>/dev/null)")
+total_secure_files=$(num "$(jq 'length' "$SECUREFILES_FILE" 2>/dev/null)")
+release_env_count=$(num "$(jq '[.[].environments] | add // 0' "$RELEASE_APPROVALS_FILE" 2>/dev/null)")
+release_manual_approvals=$(num "$(jq '[.[].manualApprovals] | add // 0' "$RELEASE_APPROVALS_FILE" 2>/dev/null)")
+release_gates=$(num "$(jq '[.[].gates] | add // 0' "$RELEASE_APPROVALS_FILE" 2>/dev/null)")
+
+# YAML environment checks are configured per environment, so they need one
+# lookup each. Capped to keep the runtime predictable on very large estates.
+if [ "$total_environments" -gt 0 ]; then
+    while IFS=$'\t' read -r c_project c_envid; do
+        if [ -z "$c_envid" ] || [ "$c_envid" = "null" ]; then
+            continue
+        fi
+        if [ "$env_checks_checked" -ge "$MAX_ENV_CHECK_LOOKUPS" ]; then
+            break
+        fi
+        env_checks_checked=$((env_checks_checked + 1))
+        [ $((env_checks_checked % 100)) -eq 0 ] && maybe_refresh_token
+
+        c_project_enc=$(url_encode "$c_project")
+        checks_body=$(call_api "$ORG_URL/$c_project_enc/_apis/pipelines/checks/configurations?resourceType=environment&resourceId=$c_envid&api-version=7.1-preview.1")
+        [ "$checks_body" = "API_ERROR" ] && continue
+        echo "$checks_body" | jq empty 2>/dev/null || continue
+        echo "$checks_body" | jq -c --arg proj "$c_project" '
+            .value[]? | {project: $proj, type: (.type.name // "Unknown")}' \
+            >> "$TEMP_DATA_DIR/checks.ndjson" 2>/dev/null
+    done < <(jq -r '.[] | [.project, ((.id // "null") | tostring)] | @tsv' "$ENVIRONMENTS_FILE" 2>/dev/null)
+
+    if [ "$total_environments" -gt "$MAX_ENV_CHECK_LOOKUPS" ]; then
+        report_warn "Only the first $MAX_ENV_CHECK_LOOKUPS of $total_environments environments were inspected for approvals and gates - those counts are a LOWER BOUND."
+    fi
+fi
+
+ndjson_to_array "$TEMP_DATA_DIR/checks.ndjson" "$CHECKS_FILE"
+env_approvals=$(num "$(jq '[.[] | select(.type == "Approval")] | length' "$CHECKS_FILE" 2>/dev/null)")
+env_gates=$(num "$(jq '[.[] | select(.type == "Task Check" or .type == "CheckTask" or (.type | test("(?i)gate|invoke")))] | length' "$CHECKS_FILE" 2>/dev/null)")
+env_other_checks=$(num "$(jq 'length' "$CHECKS_FILE" 2>/dev/null)")
+env_other_checks=$((env_other_checks - env_approvals - env_gates))
+[ "$env_other_checks" -lt 0 ] && env_other_checks=0
+
+echo "YAML Environments: $total_environments" | tee -a "$REPORT_FILE"
+echo "  Environments inspected for checks: $env_checks_checked" | tee -a "$REPORT_FILE"
+echo "  Manual approval checks:            $env_approvals" | tee -a "$REPORT_FILE"
+echo "  Gate / invoke checks:              $env_gates" | tee -a "$REPORT_FILE"
+echo "  Other checks (locks, hours, etc):  $env_other_checks" | tee -a "$REPORT_FILE"
+if [ "$env_other_checks" -gt 0 ] || [ "$env_approvals" -gt 0 ] || [ "$env_gates" -gt 0 ]; then
+    echo "" | tee -a "$REPORT_FILE"
+    echo "  Check types in use:" | tee -a "$REPORT_FILE"
+    jq -r 'group_by(.type) | map({type: .[0].type, count: length}) | sort_by(-.count) | .[]
+           | "    - \(.type): \(.count)"' "$CHECKS_FILE" | tee -a "$REPORT_FILE"
+fi
+
+echo "" | tee -a "$REPORT_FILE"
+echo "Classic Release Approvals & Gates:" | tee -a "$REPORT_FILE"
+echo "  Release stages (environments):     $release_env_count" | tee -a "$REPORT_FILE"
+echo "  Stages with a manual approval:     $release_manual_approvals" | tee -a "$REPORT_FILE"
+echo "  Stages with a deployment gate:     $release_gates" | tee -a "$REPORT_FILE"
+
+echo "" | tee -a "$REPORT_FILE"
+echo "Secrets & Secure Files to Recreate:" | tee -a "$REPORT_FILE"
+echo "  Secret variables in variable groups: ${total_secret_variables:-0}" | tee -a "$REPORT_FILE"
+echo "  Key Vault backed variable groups:    ${keyvault_vargroups:-0}" | tee -a "$REPORT_FILE"
+echo "  Secure files (certs, keystores):     $total_secure_files" | tee -a "$REPORT_FILE"
+echo "  Service connections to re-auth:      ${total_service_connections:-0}" | tee -a "$REPORT_FILE"
+echo "" | tee -a "$REPORT_FILE"
+echo "Secret VALUES are never readable through the API and are not collected." | tee -a "$REPORT_FILE"
+echo "Every item above is a manual re-entry during migration - this is the count" | tee -a "$REPORT_FILE"
+echo "to multiply by an effort-per-item assumption." | tee -a "$REPORT_FILE"
+
+# ========================================
+# 20. PIPELINE MIGRATION COMPLEXITY
+# ========================================
+write_section "20. Pipeline Migration Complexity"
+
+# Grouping pipelines by conversion difficulty turns a pipeline count into a
+# migration estimate. Classification uses only observed facts: the pipeline
+# type, and the job, task and extension-task counts seen in the timeline sample.
+# Pipelines that did not run during the window cannot be classified and are
+# reported separately rather than assumed simple.
+
+COMPLEXITY_FILE="$TEMP_DATA_DIR/complexity.json"
+echo "[]" > "$COMPLEXITY_FILE"
+
+if [ "$(num "$(jq 'length' "$TIMELINE_PERBUILD_FILE" 2>/dev/null)")" -eq 0 ]; then
+    echo "Not available: no job-level data was collected (see section 16)." | tee -a "$REPORT_FILE"
+    echo "Without it, pipelines can only be split by type:" | tee -a "$REPORT_FILE"
+    echo "  YAML:    ${yaml_pipelines:-0}" | tee -a "$REPORT_FILE"
+    echo "  Classic: ${classic_pipelines:-0}  (classic always converts as complex)" | tee -a "$REPORT_FILE"
+else
+    jq -n --slurpfile pb "$TIMELINE_PERBUILD_FILE" --slurpfile defs "$PIPELINE_DEFS_FILE" '
+        (($defs[0] // [])
+         | map({key: ((.project // "") + "#" + ((.id // 0) | tostring)), value: .})
+         | from_entries) as $dmap
+        | (($pb[0] // [])
+           | map(. + {_key: ((.project // "") + "#" + ((.definitionId // 0) | tostring))})
+           | group_by(._key)
+           | map({
+               key: .[0]._key,
+               project: .[0].project,
+               definitionId: .[0].definitionId,
+               jobs: ([.[].jobs // 0] | max),
+               distinctTasks: ([.[].distinctTasks // 0] | max),
+               extTasks: ([.[].extTasks // 0] | max),
+               observedBuilds: length
+             }))
+        | map(. + {
+            name: (($dmap[.key] // {}) | .name // "unknown"),
+            processType: (($dmap[.key] // {}) | .processType // 0)
+          })
+        | map(. + {
+            complexity:
+                (if (.processType == 1) or (.jobs >= 3) or (.distinctTasks >= 30) or (.extTasks >= 3)
+                 then "complex"
+                 elif (.jobs >= 2) or (.distinctTasks >= 10) or (.extTasks >= 1)
+                 then "moderate"
+                 else "simple" end)
+          })' > "$COMPLEXITY_FILE" 2>/dev/null || echo "[]" > "$COMPLEXITY_FILE"
+
+    complexity_observed=$(num "$(jq 'length' "$COMPLEXITY_FILE" 2>/dev/null)")
+    complexity_simple=$(num "$(jq '[.[] | select(.complexity == "simple")] | length' "$COMPLEXITY_FILE" 2>/dev/null)")
+    complexity_moderate=$(num "$(jq '[.[] | select(.complexity == "moderate")] | length' "$COMPLEXITY_FILE" 2>/dev/null)")
+    complexity_complex=$(num "$(jq '[.[] | select(.complexity == "complex")] | length' "$COMPLEXITY_FILE" 2>/dev/null)")
+
+    echo "Classification rules (all observed, none assumed):" | tee -a "$REPORT_FILE"
+    echo "  simple   - YAML, 1 job, under 10 distinct tasks, no extension tasks" | tee -a "$REPORT_FILE"
+    echo "  moderate - 2 jobs, 10+ distinct tasks, or 1-2 extension tasks" | tee -a "$REPORT_FILE"
+    echo "  complex  - classic, 3+ jobs, 30+ distinct tasks, or 3+ extension tasks" | tee -a "$REPORT_FILE"
+    echo "" | tee -a "$REPORT_FILE"
+    echo "Pipelines observed in the timeline sample: $complexity_observed" | tee -a "$REPORT_FILE"
+    echo "  Simple:   $complexity_simple" | tee -a "$REPORT_FILE"
+    echo "  Moderate: $complexity_moderate" | tee -a "$REPORT_FILE"
+    echo "  Complex:  $complexity_complex" | tee -a "$REPORT_FILE"
+
+    if [ "$complexity_observed" -gt 0 ] && [ "${active_pipelines:-0}" -gt "$complexity_observed" ]; then
+        echo "" | tee -a "$REPORT_FILE"
+        echo "Extrapolated to all ${active_pipelines} active pipelines (same proportions):" | tee -a "$REPORT_FILE"
+        jq -rn --argjson active "$(num "${active_pipelines:-0}")" \
+               --argjson obs "$complexity_observed" \
+               --argjson s "$complexity_simple" \
+               --argjson m "$complexity_moderate" \
+               --argjson c "$complexity_complex" '
+            "  Simple:   \(($s / $obs * $active) | round)",
+            "  Moderate: \(($m / $obs * $active) | round)",
+            "  Complex:  \(($c / $obs * $active) | round)"' | tee -a "$REPORT_FILE"
+    fi
+
+    if [ "$complexity_complex" -gt 0 ]; then
+        echo "" | tee -a "$REPORT_FILE"
+        echo "Most complex pipelines observed (top 15):" | tee -a "$REPORT_FILE"
+        jq -r '[.[] | select(.complexity == "complex")]
+               | sort_by(-(.extTasks * 100 + .distinctTasks + .jobs)) | .[:15][]
+               | "  - \(.project) / \(.name): \(.jobs) jobs, \(.distinctTasks) distinct tasks, \(.extTasks) extension tasks"' \
+            "$COMPLEXITY_FILE" | tee -a "$REPORT_FILE"
+    fi
+
+    echo "" | tee -a "$REPORT_FILE"
+    echo "Dormant pipelines (${dead_pipelines:-0}) are excluded - they should be" | tee -a "$REPORT_FILE"
+    echo "retired rather than migrated, and are the cleanup group to confirm." | tee -a "$REPORT_FILE"
+fi
+
+# ========================================
+# 21. AZURE DEVOPS COMMERCIAL BASELINE
+# ========================================
+write_section "21. Azure DevOps Commercial Baseline"
+maybe_refresh_token
+
+# The quantities that make up the current Azure DevOps bill. Prices are
+# deliberately not applied: unit price depends on your own agreement and
+# is not exposed by any API. These are the multiplicands only.
+
+RESOURCE_USAGE_FILE="$TEMP_DATA_DIR/resource_usage.json"
+ENTITLEMENT_FILE="$TEMP_DATA_DIR/entitlement_summary.json"
+echo "[]" > "$RESOURCE_USAGE_FILE"
+echo "{}" > "$ENTITLEMENT_FILE"
+rm -f "$TEMP_DATA_DIR/resource_usage.ndjson"
+touch "$TEMP_DATA_DIR/resource_usage.ndjson"
+
+while IFS=' ' read -r ru_tag ru_hosted; do
+    [ -z "$ru_tag" ] && continue
+    ru_body=$(call_api "$ORG_URL/_apis/distributedtask/resourceusage?parallelismTag=$ru_tag&poolIsHosted=$ru_hosted&includeRunningRequests=false&api-version=7.1-preview.1")
+    [ "$ru_body" = "API_ERROR" ] && continue
+    echo "$ru_body" | jq empty 2>/dev/null || continue
+    echo "$ru_body" | jq -c --arg tag "$ru_tag" --argjson hosted "$ru_hosted" '{
+        parallelismTag: $tag,
+        hosted: $hosted,
+        purchasedCount: (.resourceLimit.totalCount // .totalCount // null),
+        includedMinutes: (.resourceLimit.totalMinutes // null),
+        usedCount: (.usedCount // null),
+        usedMinutes: (.usedMinutes // null)
+      }' >> "$TEMP_DATA_DIR/resource_usage.ndjson" 2>/dev/null
+done <<'RU_COMBOS'
+Private true
+Private false
+Public true
+RU_COMBOS
+ndjson_to_array "$TEMP_DATA_DIR/resource_usage.ndjson" "$RESOURCE_USAGE_FILE"
+
+hosted_parallel_purchased=$(num "$(jq -r '[.[] | select(.hosted == true and .parallelismTag == "Private") | .purchasedCount // 0] | max // 0' "$RESOURCE_USAGE_FILE" 2>/dev/null)")
+hosted_parallel_used=$(num "$(jq -r '[.[] | select(.hosted == true and .parallelismTag == "Private") | .usedCount // 0] | max // 0' "$RESOURCE_USAGE_FILE" 2>/dev/null)")
+selfhosted_parallel_purchased=$(num "$(jq -r '[.[] | select(.hosted == false and .parallelismTag == "Private") | .purchasedCount // 0] | max // 0' "$RESOURCE_USAGE_FILE" 2>/dev/null)")
+selfhosted_parallel_used=$(num "$(jq -r '[.[] | select(.hosted == false and .parallelismTag == "Private") | .usedCount // 0] | max // 0' "$RESOURCE_USAGE_FILE" 2>/dev/null)")
+
+echo "Parallel Jobs (the Azure Pipelines billing unit):" | tee -a "$REPORT_FILE"
+if [ "$(num "$(jq 'length' "$RESOURCE_USAGE_FILE" 2>/dev/null)")" -eq 0 ]; then
+    echo "  Not available to this account - take the purchased parallel job" | tee -a "$REPORT_FILE"
+    echo "  Microsoft-hosted and self-hosted parallel job counts." | tee -a "$REPORT_FILE"
+    report_warn "Parallel job entitlement could not be read - take the Azure DevOps pipeline cost baseline from your billing statement."
+else
+    jq -r '.[] | "  - \(.parallelismTag) / \(if .hosted then "Microsoft-hosted" else "self-hosted" end): purchased \(.purchasedCount // "unknown"), in use \(.usedCount // "unknown")\(if .includedMinutes != null then ", included minutes \(.includedMinutes)" else "" end)"' \
+        "$RESOURCE_USAGE_FILE" | tee -a "$REPORT_FILE"
+fi
+
+ent_body=$(call_api "https://vsaex.dev.azure.com/$ORG/_apis/userentitlementsummary?select=licenses&api-version=7.1-preview.2")
+if [ "$ent_body" != "API_ERROR" ] && echo "$ent_body" | jq empty 2>/dev/null; then
+    echo "$ent_body" > "$ENTITLEMENT_FILE"
+    echo "" | tee -a "$REPORT_FILE"
+    echo "Licence Entitlements (quantities, not prices):" | tee -a "$REPORT_FILE"
+    jq -r '
+        (.licenses // []) as $l
+        | if ($l | length) == 0 then "  Not reported by the API."
+          else ($l[] | "  - \(.licenseName // .accountLicenseType // .license // "unknown"): assigned \(.assigned // 0) of \(.total // 0)")
+          end' "$ENTITLEMENT_FILE" 2>/dev/null | tee -a "$REPORT_FILE"
+else
+    echo "" | tee -a "$REPORT_FILE"
+    echo "Licence Entitlements: not available to this account." | tee -a "$REPORT_FILE"
+    echo "  Section 11 still provides per-user access levels as a substitute." | tee -a "$REPORT_FILE"
+fi
+
+echo "" | tee -a "$REPORT_FILE"
+echo "Also part of the current bill, and NOT readable from Azure DevOps:" | tee -a "$REPORT_FILE"
+echo "  - unit prices and any enterprise agreement discount" | tee -a "$REPORT_FILE"
+echo "  - infrastructure cost of the self-hosted agent fleet" | tee -a "$REPORT_FILE"
+echo "  - Azure Artifacts storage tier and any storage overage" | tee -a "$REPORT_FILE"
+echo "  - internal or partner effort operating the platform" | tee -a "$REPORT_FILE"
+
+# ========================================
+# 22. MIGRATION ASSESSMENT SUMMARY
+# ========================================
+write_section "22. MIGRATION ASSESSMENT SUMMARY"
+
+# One page containing every figure a cost model needs, each labelled with how it
+# was obtained. Anything the API cannot answer is listed explicitly so it is
+# recorded as an explicit assumption rather than silently guessed.
+
+if [ "$(num "${jobreq_total:-0}")" -gt 0 ] && [ "$(num "${billable_job_minutes_month:-0}")" -gt 0 ]; then
+    weighted_minutes_month=$(jq -rn \
+        --argjson m "$(num "${billable_job_minutes_month:-0}")" \
+        --argjson f "$(numf "${os_multiplier_factor:-0}")" \
+        '($m * $f) | floor' 2>/dev/null)
+fi
+weighted_minutes_month=$(num "${weighted_minutes_month:-0}")
+
+total_compute_minutes_month=$(( $(num "${billable_job_minutes_month:-0}") + $(num "${deployment_minutes_month:-0}") ))
+
+echo "Organization: $ORG" | tee -a "$REPORT_FILE"
+echo "Measurement window: $HISTORY_DAYS days from $HISTORY_START" | tee -a "$REPORT_FILE"
+echo "" | tee -a "$REPORT_FILE"
+echo "This section is the hand-over summary. If you have been asked to share" | tee -a "$REPORT_FILE"
+echo "these findings with a migration or licensing assessment, this page plus" | tee -a "$REPORT_FILE"
+echo "the JSON file is what they need." | tee -a "$REPORT_FILE"
+echo "" | tee -a "$REPORT_FILE"
+echo "Every line is labelled with its basis:" | tee -a "$REPORT_FILE"
+echo "  MEASURED     - read directly from the Azure DevOps API" | tee -a "$REPORT_FILE"
+echo "  EXTRAPOLATED - measured on a sample, scaled to the estate" | tee -a "$REPORT_FILE"
+echo "  UNKNOWN      - not exposed by the API; supply it yourself" | tee -a "$REPORT_FILE"
+echo "" | tee -a "$REPORT_FILE"
+
+echo "A. COMPUTE - inputs to a per-job billing model" | tee -a "$REPORT_FILE"
+echo "----------------------------------------------------------------" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Build wall-clock minutes / month" "${minutes_per_month:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+if [ "${timeline_sampled:-0}" -gt 0 ]; then
+    if [ "${timeline_is_sample:-0}" = "1" ]; then
+        printf '  %-46s %12s  %s\n' "Billable JOB minutes / month" "${billable_job_minutes_month:-0}" "EXTRAPOLATED (${timeline_sampled} builds)" | tee -a "$REPORT_FILE"
+    else
+        printf '  %-46s %12s  %s\n' "Billable JOB minutes / month" "${billable_job_minutes_month:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+    fi
+    printf '  %-46s %12s  %s\n' "Job-to-wall-clock expansion ratio" "${job_expansion_ratio:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+    printf '  %-46s %12s  %s\n' "Average jobs per build" "${avg_jobs_per_build:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+else
+    printf '  %-46s %12s  %s\n' "Billable JOB minutes / month" "n/a" "UNKNOWN - section 16 did not run" | tee -a "$REPORT_FILE"
+fi
+printf '  %-46s %12s  %s\n' "Deployment (release) minutes / month" "${deployment_minutes_month:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "TOTAL compute minutes / month" "$total_compute_minutes_month" "derived" | tee -a "$REPORT_FILE"
+if [ "$(num "${jobreq_total:-0}")" -gt 0 ]; then
+    printf '  %-46s %12s  %s\n' "OS weighted multiplier (L${MULT_LINUX}/W${MULT_WINDOWS}/M${MULT_MACOS})" "${os_multiplier_factor:-0}x" "MEASURED (${jobreq_window_days}d window)" | tee -a "$REPORT_FILE"
+    printf '  %-46s %12s  %s\n' "Linux-equivalent minutes / month" "${weighted_minutes_month:-0}" "derived" | tee -a "$REPORT_FILE"
+else
+    printf '  %-46s %12s  %s\n' "OS weighted multiplier" "n/a" "UNKNOWN - Win/Linux/macOS split unmeasured" | tee -a "$REPORT_FILE"
+fi
+
+echo "" | tee -a "$REPORT_FILE"
+echo "B. RUNNER FLEET SIZING" | tee -a "$REPORT_FILE"
+echo "----------------------------------------------------------------" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Peak concurrent builds" "${peak_concurrency:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Average concurrent builds" "${avg_concurrency:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Queue wait P95 (seconds)" "${queue_p95:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Self-hosted pools" "${selfhosted_pools:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Self-hosted agents" "${total_agents:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+if [ "${agents_with_cpu:-0}" -gt 0 ]; then
+    printf '  %-46s %12s  %s\n' "Self-hosted fleet vCPU" "${total_vcpu:-0}" "MEASURED (${agents_with_cpu} agents)" | tee -a "$REPORT_FILE"
+else
+    printf '  %-46s %12s  %s\n' "Self-hosted fleet vCPU" "n/a" "UNKNOWN - ask for VM sizes" | tee -a "$REPORT_FILE"
+fi
+printf '  %-46s %12s  %s\n' "Self-hosted infrastructure cost" "n/a" "UNKNOWN - supply this" | tee -a "$REPORT_FILE"
+
+echo "" | tee -a "$REPORT_FILE"
+echo "C. SEATS" | tee -a "$REPORT_FILE"
+echo "----------------------------------------------------------------" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Total users" "${user_count:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Active users (90 days)" "${active_90:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Never signed in" "${never_accessed:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Stakeholders (free in ADO, often paid elsewhere)" "${stakeholder_count:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Unique committers (committer-licensing unit)" "${unique_committers:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+
+echo "" | tee -a "$REPORT_FILE"
+echo "D. CURRENT AZURE DEVOPS BASELINE" | tee -a "$REPORT_FILE"
+echo "----------------------------------------------------------------" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "MS-hosted parallel jobs purchased" "${hosted_parallel_purchased:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Self-hosted parallel jobs purchased" "${selfhosted_parallel_purchased:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Unit prices / EA discount" "n/a" "UNKNOWN - supply this" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Artifacts storage cost" "n/a" "UNKNOWN - supply this" | tee -a "$REPORT_FILE"
+
+echo "" | tee -a "$REPORT_FILE"
+echo "E. MIGRATION EFFORT" | tee -a "$REPORT_FILE"
+echo "----------------------------------------------------------------" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Active pipelines (in scope)" "${active_pipelines:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Dormant pipelines (retire, do not migrate)" "${dead_pipelines:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+if [ "${complexity_observed:-0}" -gt 0 ]; then
+    printf '  %-46s %12s  %s\n' "Observed simple / moderate / complex" "${complexity_simple}/${complexity_moderate}/${complexity_complex}" "MEASURED" | tee -a "$REPORT_FILE"
+else
+    printf '  %-46s %12s  %s\n' "Complexity split" "n/a" "UNKNOWN - section 16 did not run" | tee -a "$REPORT_FILE"
+fi
+printf '  %-46s %12s  %s\n' "Classic release pipelines (rewrite)" "${total_release_defs:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Task groups (become composite actions)" "${total_taskgroups:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Extension tasks actually in use" "${ext_tasks_used:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Service connections to recreate" "${total_service_connections:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Secret variables to re-enter" "${total_secret_variables:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Secure files to re-upload" "${total_secure_files:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Approvals + gates to rebuild" "$(( env_approvals + env_gates + release_manual_approvals + release_gates ))" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Integrations needing custom work" "${custom_count:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+
+echo "" | tee -a "$REPORT_FILE"
+echo "F. PLEASE PROVIDE THESE ALONGSIDE THE REPORT" | tee -a "$REPORT_FILE"
+echo "----------------------------------------------------------------" | tee -a "$REPORT_FILE"
+echo "  None of the following is exposed by any Azure DevOps API, so it cannot" | tee -a "$REPORT_FILE"
+echo "  be collected automatically. Whoever prepares the cost assessment will" | tee -a "$REPORT_FILE"
+echo "  need it. Rough figures or ranges are fine - where something is genuinely" | tee -a "$REPORT_FILE"
+echo "  unknown, say so and it will be recorded as a stated assumption." | tee -a "$REPORT_FILE"
+echo "" | tee -a "$REPORT_FILE"
+echo "  1. Cost of the self-hosted agent infrastructure (VMs, storage, network)." | tee -a "$REPORT_FILE"
+echo "  2. Azure DevOps unit prices and any enterprise agreement discount." | tee -a "$REPORT_FILE"
+echo "  3. Internal or partner effort operating the platform today (FTE)." | tee -a "$REPORT_FILE"
+echo "  4. Whether the comparison should cover the current estate or the estate" | tee -a "$REPORT_FILE"
+echo "     after retiring the ${dead_pipelines:-0} dormant pipelines." | tee -a "$REPORT_FILE"
+echo "  5. Workloads that cannot move for compliance, networking or technical" | tee -a "$REPORT_FILE"
+echo "     reasons, and therefore stay on self-hosted runners." | tee -a "$REPORT_FILE"
+echo "  6. Whether migration and professional services are in or out of scope." | tee -a "$REPORT_FILE"
+echo "  7. The unit rates current at the time of your analysis for whichever" | tee -a "$REPORT_FILE"
+echo "     platforms you are comparing, plus any vendor quotes held." | tee -a "$REPORT_FILE"
+if [ "$(num "${jobreq_total:-0}")" -eq 0 ]; then
+    echo "  8. The Windows, Linux and macOS split of pipeline minutes - this could" | tee -a "$REPORT_FILE"
+    echo "     not be measured and is the largest single cost variable." | tee -a "$REPORT_FILE"
+fi
+
+echo "" | tee -a "$REPORT_FILE"
+echo "RECONCILIATION NOTE" | tee -a "$REPORT_FILE"
+echo "----------------------------------------------------------------" | tee -a "$REPORT_FILE"
+echo "If another report quotes a minute figure that differs from the numbers above," | tee -a "$REPORT_FILE"
+echo "establish which measure it is before comparing anything:" | tee -a "$REPORT_FILE"
+echo "  - build wall-clock            -> section 12 (${minutes_per_month:-0} /month)" | tee -a "$REPORT_FILE"
+echo "  - job execution time          -> section 16 (${raw_job_minutes_month:-0} /month)" | tee -a "$REPORT_FILE"
+echo "  - job time with Actions round -> section 16 (${billable_job_minutes_month:-0} /month)" | tee -a "$REPORT_FILE"
+echo "  - agent lease or availability -> not measured here; ask how it was produced" | tee -a "$REPORT_FILE"
+echo "A figure that matches none of these is most likely agent availability or a" | tee -a "$REPORT_FILE"
+echo "different reporting period, and must not have an Actions rate applied to it." | tee -a "$REPORT_FILE"
+
+# Sharing is the point of this report, so state plainly what is and is not in
+# it. An administrator should be able to satisfy themselves in one screen that
+# nothing sensitive leaves the organization.
+echo "" | tee -a "$REPORT_FILE"
+echo "BEFORE YOU SHARE THIS REPORT" | tee -a "$REPORT_FILE"
+echo "----------------------------------------------------------------" | tee -a "$REPORT_FILE"
+echo "This report was produced by read-only API calls. Nothing was created," | tee -a "$REPORT_FILE"
+echo "changed or deleted in Azure DevOps." | tee -a "$REPORT_FILE"
+echo "" | tee -a "$REPORT_FILE"
+echo "This report CONTAINS:" | tee -a "$REPORT_FILE"
+echo "  - counts, durations, dates and aggregate statistics" | tee -a "$REPORT_FILE"
+echo "  - names of projects, repositories, pipelines, agent pools," | tee -a "$REPORT_FILE"
+echo "    environments, variable groups and service connections" | tee -a "$REPORT_FILE"
+echo "  - names of installed extensions and the tasks pipelines execute" | tee -a "$REPORT_FILE"
+if [ "$SCAN_LARGE_FILES" = "1" ]; then
+    echo "  - paths of large files found in repositories (SCAN_LARGE_FILES=1)" | tee -a "$REPORT_FILE"
+fi
+echo "" | tee -a "$REPORT_FILE"
+echo "It does NOT contain:" | tee -a "$REPORT_FILE"
+echo "  - any secret, password, token, certificate or variable VALUE" | tee -a "$REPORT_FILE"
+echo "  - source code or file contents" | tee -a "$REPORT_FILE"
+echo "  - work item titles, descriptions or comments (only a count is read)" | tee -a "$REPORT_FILE"
+echo "  - build logs, test output or commit messages" | tee -a "$REPORT_FILE"
+echo "  - names or email addresses of individual people" | tee -a "$REPORT_FILE"
+echo "  - the location of any secret scanning finding (counts only)" | tee -a "$REPORT_FILE"
+echo "" | tee -a "$REPORT_FILE"
+echo "People appear only as COUNTS (licence totals, active users, distinct" | tee -a "$REPORT_FILE"
+echo "pipeline authors). No individual is identified." | tee -a "$REPORT_FILE"
+if [ "$EXPORT_USER_DETAILS" = "1" ]; then
+    echo "" | tee -a "$REPORT_FILE"
+    echo "EXCEPTION - you ran with EXPORT_USER_DETAILS=1:" | tee -a "$REPORT_FILE"
+    echo "  A separate users CSV was written containing DISPLAY NAMES and" | tee -a "$REPORT_FILE"
+    echo "  EMAIL ADDRESSES. That file is personal data. It is not part of" | tee -a "$REPORT_FILE"
+    echo "  this report and is not needed for estate sizing - keep it" | tee -a "$REPORT_FILE"
+    echo "  internal and do not include it when sharing these findings." | tee -a "$REPORT_FILE"
+fi
+if [ "$EXPORT_SECRET_DETAILS" = "1" ]; then
+    echo "" | tee -a "$REPORT_FILE"
+    echo "EXCEPTION - you ran with EXPORT_SECRET_DETAILS=1:" | tee -a "$REPORT_FILE"
+    echo "  Separate secret scanning files were written identifying the FILE" | tee -a "$REPORT_FILE"
+    echo "  PATH, LINE NUMBER and BRANCH of each detected credential (never the" | tee -a "$REPORT_FILE"
+    echo "  values). That is a map of where your unremediated secrets are. It" | tee -a "$REPORT_FILE"
+    echo "  is not part of this report and is not needed for estate sizing -" | tee -a "$REPORT_FILE"
+    echo "  keep it internal and do not include it when sharing these findings." | tee -a "$REPORT_FILE"
+fi
+echo "" | tee -a "$REPORT_FILE"
+echo "Project and pipeline names can still be commercially sensitive. Review" | tee -a "$REPORT_FILE"
+echo "this report before sending it outside your organization and redact any" | tee -a "$REPORT_FILE"
+echo "names you would rather not disclose - the counts and minutes stay" | tee -a "$REPORT_FILE"
+echo "usable without them." | tee -a "$REPORT_FILE"
+
+# ========================================
 # SUMMARY
 # ========================================
 write_section "Migration Data Summary"
@@ -2267,8 +3703,8 @@ echo "--- 2. Licensing ---" | tee -a "$REPORT_FILE"
 echo "Total Users: $user_count" | tee -a "$REPORT_FILE"
 echo "Active users (90d): ${active_90:-0}" | tee -a "$REPORT_FILE"
 echo "Never signed in: ${never_accessed:-0}" | tee -a "$REPORT_FILE"
-echo "Stakeholder users (become paid GitHub seats): ${stakeholder_count:-0}" | tee -a "$REPORT_FILE"
-echo "Unique committers (GHAS billing unit): ${unique_committers:-0}" | tee -a "$REPORT_FILE"
+echo "Stakeholder users (free in ADO): ${stakeholder_count:-0}" | tee -a "$REPORT_FILE"
+echo "Unique committers: ${unique_committers:-0}" | tee -a "$REPORT_FILE"
 
 echo "" | tee -a "$REPORT_FILE"
 echo "--- 3. Migration Effort (ADO transform) ---" | tee -a "$REPORT_FILE"
@@ -2281,13 +3717,13 @@ echo "Variable Groups: ${total_vargroups:-0}" | tee -a "$REPORT_FILE"
 echo "Repositories with Pipelines: $repos_with_pipelines" | tee -a "$REPORT_FILE"
 
 echo "" | tee -a "$REPORT_FILE"
-echo "--- 4. Integrations & GitHub Apps ---" | tee -a "$REPORT_FILE"
+echo "--- 4. Integrations & Extensions ---" | tee -a "$REPORT_FILE"
 echo "Service Connections: ${total_service_connections:-0}" | tee -a "$REPORT_FILE"
 echo "Marketplace Extensions: ${total_extensions:-0}" | tee -a "$REPORT_FILE"
 echo "Service Hooks: $total_hooks" | tee -a "$REPORT_FILE"
-echo "Mapped out-of-the-box: ${oob_count:-0}" | tee -a "$REPORT_FILE"
-echo "Mapped to Marketplace action: ${market_count:-0}" | tee -a "$REPORT_FILE"
-echo "Mapped to Partner App: ${partner_count:-0}" | tee -a "$REPORT_FILE"
+echo "Native platform feature: ${oob_count:-0}" | tee -a "$REPORT_FILE"
+echo "Off-the-shelf component: ${market_count:-0}" | tee -a "$REPORT_FILE"
+echo "Publisher-supported: ${partner_count:-0}" | tee -a "$REPORT_FILE"
 echo "Needing custom work: ${custom_count:-0}" | tee -a "$REPORT_FILE"
 
 echo "" | tee -a "$REPORT_FILE"
@@ -2362,10 +3798,60 @@ jq -n \
   --argjson secretAlerts "${total_secret_alerts:-0}" \
   --argjson dependencyAlerts "${total_dependency_alerts:-0}" \
   --argjson codeAlerts "${total_code_alerts:-0}" \
+  --argjson tlSampled "$(num "${timeline_sampled:-0}")" \
+  --argjson tlStride "$(num "${timeline_stride:-1}")" \
+  --argjson tlIsSample "$(num "${timeline_is_sample:-0}")" \
+  --argjson tlJobs "$(num "${timeline_jobs:-0}")" \
+  --argjson avgJobsPerBuild "$(numf "${avg_jobs_per_build:-0}")" \
+  --argjson expansionRatio "$(numf "${job_expansion_ratio:-0}")" \
+  --argjson billableWindow "$(num "${billable_job_minutes_window:-0}")" \
+  --argjson billableMonth "$(num "${billable_job_minutes_month:-0}")" \
+  --argjson rawJobMonth "$(num "${raw_job_minutes_month:-0}")" \
+  --argjson tasksUsed "$(num "${distinct_tasks_used:-0}")" \
+  --argjson extTasksUsed "$(num "${ext_tasks_used:-0}")" \
+  --argjson jobReqTotal "$(num "${jobreq_total:-0}")" \
+  --argjson jobReqDays "$(numf "${jobreq_window_days:-0}")" \
+  --argjson osFactor "$(numf "${os_multiplier_factor:-0}")" \
+  --argjson multLinux "$(numf "$MULT_LINUX")" \
+  --argjson multWindows "$(numf "$MULT_WINDOWS")" \
+  --argjson multMacos "$(numf "$MULT_MACOS")" \
+  --argjson weightedMonth "$(num "${weighted_minutes_month:-0}")" \
+  --argjson avgConcurrency "$(numf "${avg_concurrency:-0}")" \
+  --argjson fleetVcpu "$(num "${total_vcpu:-0}")" \
+  --argjson agentsWithCpu "$(num "${agents_with_cpu:-0}")" \
+  --argjson deployments "$(num "${total_deployments:-0}")" \
+  --argjson deployMinutesWindow "$(num "${deployment_minutes_window:-0}")" \
+  --argjson deployMinutesMonth "$(num "${deployment_minutes_month:-0}")" \
+  --argjson environments "$(num "${total_environments:-0}")" \
+  --argjson envInspected "$(num "${env_checks_checked:-0}")" \
+  --argjson envApprovals "$(num "${env_approvals:-0}")" \
+  --argjson envGates "$(num "${env_gates:-0}")" \
+  --argjson envOtherChecks "$(num "${env_other_checks:-0}")" \
+  --argjson relEnvs "$(num "${release_env_count:-0}")" \
+  --argjson relApprovals "$(num "${release_manual_approvals:-0}")" \
+  --argjson relGates "$(num "${release_gates:-0}")" \
+  --argjson secureFiles "$(num "${total_secure_files:-0}")" \
+  --argjson secretVariables "$(num "${total_secret_variables:-0}")" \
+  --argjson cxObserved "$(num "${complexity_observed:-0}")" \
+  --argjson cxSimple "$(num "${complexity_simple:-0}")" \
+  --argjson cxModerate "$(num "${complexity_moderate:-0}")" \
+  --argjson cxComplex "$(num "${complexity_complex:-0}")" \
+  --argjson hostedPurchased "$(num "${hosted_parallel_purchased:-0}")" \
+  --argjson hostedUsed "$(num "${hosted_parallel_used:-0}")" \
+  --argjson selfPurchased "$(num "${selfhosted_parallel_purchased:-0}")" \
+  --argjson selfUsed "$(num "${selfhosted_parallel_used:-0}")" \
+  --slurpfile osMix <(jq '.byOs // []' "${JOBREQ_STATS_FILE:-/dev/null}" 2>/dev/null || echo '[]') \
+  --slurpfile imageMix <(jq '.byImage // []' "${JOBREQ_STATS_FILE:-/dev/null}" 2>/dev/null || echo '[]') \
+  --slurpfile taskUsage <(jq '.[:50]' "${TASK_USAGE_FILE:-/dev/null}" 2>/dev/null || echo '[]') \
+  --slurpfile checkTypes <(jq 'group_by(.type) | map({type: .[0].type, count: length}) | sort_by(-.count)' "${CHECKS_FILE:-/dev/null}" 2>/dev/null || echo '[]') \
+  --slurpfile resourceUsage <(cat "${RESOURCE_USAGE_FILE:-/dev/null}" 2>/dev/null || echo '[]') \
+  --slurpfile deployStats <(cat "${DEPLOY_STATS_FILE:-/dev/null}" 2>/dev/null || echo '{}') \
   --slurpfile buildStats "${BUILD_STATS_FILE:-/dev/null}" \
   --slurpfile connTypes <(jq 'group_by(.type) | map({type: .[0].type, count: length}) | sort_by(-.count)' "${SERVICE_CONN_FILE:-/dev/null}" 2>/dev/null || echo '[]') \
   --slurpfile extList <(jq 'map({publisher, name})' "${EXTENSIONS_FILE:-/dev/null}" 2>/dev/null || echo '[]') \
   --slurpfile warnList <(jq -R -s 'split("\n") | map(select(length > 0))' "${WARNINGS_FILE:-/dev/null}" 2>/dev/null || echo '[]') \
+  --argjson throttled "$(num "$(http_throttle_count)")" \
+  --slurpfile httpErrors <(jq -R -s 'split("\n") | map(select(length > 0)) | group_by(.) | map({status: .[0], count: length}) | sort_by(-.count)' "${HTTP_STATUS_LOG:-/dev/null}" 2>/dev/null || echo '[]') \
   '{
     meta: {
       organization: $org,
@@ -2374,7 +3860,9 @@ jq -n \
       historyStart: $historyStart,
       dataComplete: ((($warnList[0] // []) | length) == 0),
       warnings: ($warnList[0] // []),
-      schemaVersion: "1.0"
+      throttledRequests: $throttled,
+      failedRequestsByStatus: ($httpErrors[0] // []),
+      schemaVersion: "1.2"
     },
     content: {
       projects: $projects,
@@ -2390,10 +3878,11 @@ jq -n \
       computeMinutesInWindow: $totalBuildMinutes,
       computeMinutesPerMonth: $minutesPerMonth,
       peakConcurrentBuilds: $peakConcurrency,
+      averageConcurrentBuilds: $avgConcurrency,
       queueWaitP50Seconds: $queueP50,
       queueWaitP95Seconds: $queueP95,
       agentPools: { total: $totalPools, microsoftHosted: $hostedPools, selfHosted: $selfHostedPools },
-      selfHostedAgents: { registered: $totalAgents, online: $onlineAgents },
+      selfHostedAgents: { registered: $totalAgents, online: $onlineAgents, reportingCpu: $agentsWithCpu, totalVcpu: $fleetVcpu },
       byPool: ($buildStats[0].byPool // []),
       durationStats: {
         averageMinutes: ($buildStats[0].avgDurationMinutes // 0),
@@ -2453,6 +3942,81 @@ jq -n \
       secretScanningAlerts: $secretAlerts,
       dependencyScanningAlerts: $dependencyAlerts,
       codeScanningAlerts: $codeAlerts
+    },
+    tco: {
+      jobCompute: {
+        basis: (if $tlSampled == 0 then "not-collected"
+                elif $tlIsSample == 1 then "extrapolated"
+                else "measured" end),
+        sampleBuilds: $tlSampled,
+        sampleStride: $tlStride,
+        sampleJobs: $tlJobs,
+        averageJobsPerBuild: $avgJobsPerBuild,
+        billableToWallClockRatio: $expansionRatio,
+        billableJobMinutesInWindow: $billableWindow,
+        billableJobMinutesPerMonth: $billableMonth,
+        rawJobMinutesPerMonth: $rawJobMonth,
+        distinctTasksExecuted: $tasksUsed,
+        extensionTasksExecuted: $extTasksUsed,
+        topTasks: ($taskUsage[0] // [])
+      },
+      runnerMix: {
+        basis: (if $jobReqTotal == 0 then "not-available" else "measured" end),
+        jobRequestsObserved: $jobReqTotal,
+        observedWindowDays: $jobReqDays,
+        weightedMultiplier: $osFactor,
+        multipliersApplied: { linux: $multLinux, windows: $multWindows, macos: $multMacos },
+        linuxEquivalentMinutesPerMonth: $weightedMonth,
+        byOperatingSystem: ($osMix[0] // []),
+        byImage: ($imageMix[0] // [])
+      },
+      deployments: {
+        countInWindow: $deployments,
+        minutesInWindow: $deployMinutesWindow,
+        minutesPerMonth: $deployMinutesMonth,
+        byStatus: ($deployStats[0].byStatus // []),
+        topEnvironments: ($deployStats[0].topEnvironments // [])
+      },
+      approvalsAndSecrets: {
+        yamlEnvironments: $environments,
+        yamlEnvironmentsInspected: $envInspected,
+        yamlApprovalChecks: $envApprovals,
+        yamlGateChecks: $envGates,
+        yamlOtherChecks: $envOtherChecks,
+        checkTypes: ($checkTypes[0] // []),
+        releaseStages: $relEnvs,
+        releaseManualApprovals: $relApprovals,
+        releaseGates: $relGates,
+        secretVariables: $secretVariables,
+        secureFiles: $secureFiles,
+        totalToRebuild: ($envApprovals + $envGates + $relApprovals + $relGates)
+      },
+      complexity: {
+        basis: (if $cxObserved == 0 then "not-collected" else "observed-sample" end),
+        pipelinesObserved: $cxObserved,
+        simple: $cxSimple,
+        moderate: $cxModerate,
+        complex: $cxComplex
+      },
+      commercial: {
+        microsoftHostedParallelJobsPurchased: $hostedPurchased,
+        microsoftHostedParallelJobsInUse: $hostedUsed,
+        selfHostedParallelJobsPurchased: $selfPurchased,
+        selfHostedParallelJobsInUse: $selfUsed,
+        rawResourceUsage: ($resourceUsage[0] // [])
+      },
+      inputsYouMustSupply: [
+        "self-hosted agent infrastructure cost",
+        "Azure DevOps unit prices and enterprise agreement discount",
+        "internal or partner effort operating the platform (FTE)",
+        "whether the scope is the current or post-cleanup estate",
+        "workloads that cannot move for compliance or networking reasons",
+        "whether migration and professional services are in scope",
+        "any competing quote and what it includes"
+      ]
+        + (if $jobReqTotal == 0
+           then ["Windows / Linux / macOS split of pipeline minutes"]
+           else [] end)
     }
   }' > "$SIZING_JSON" 2>/dev/null
 
@@ -2478,13 +4042,36 @@ else
     done < "$WARNINGS_FILE"
 fi
 
+# API health. Throttling is the one failure mode that is entirely recoverable
+# by re-running, so it is separated from permission errors (which are not) to
+# stop an operator concluding the tool "does not work" when it simply needs a
+# quieter moment or a narrower window.
+throttle_total=$(num "$(http_throttle_count)")
+http_fail_total=$(num "$(grep -c . "$HTTP_STATUS_LOG" 2>/dev/null)")
+if [ "$http_fail_total" -gt 0 ]; then
+    echo "" | tee -a "$REPORT_FILE"
+    echo "API request failures by cause:" | tee -a "$REPORT_FILE"
+    sort "$HTTP_STATUS_LOG" 2>/dev/null | uniq -c | sort -rn | while read -r c code; do
+        echo "  $c x $(http_status_hint "$code")" | tee -a "$REPORT_FILE"
+    done
+    if [ "$throttle_total" -gt 0 ]; then
+        echo "" | tee -a "$REPORT_FILE"
+        echo "  Azure DevOps rate-limited $throttle_total request(s). The collector" | tee -a "$REPORT_FILE"
+        echo "  automatically slowed itself down and retried, but any section that" | tee -a "$REPORT_FILE"
+        echo "  still reported a warning above may be understated." | tee -a "$REPORT_FILE"
+        echo "  To reduce throttling, re-run at a quieter time, lower HISTORY_DAYS," | tee -a "$REPORT_FILE"
+        echo "  or set API_PACING_MS=250 to pace requests from the start." | tee -a "$REPORT_FILE"
+    fi
+fi
+
 echo "" | tee -a "$REPORT_FILE"
 echo "========================================" | tee -a "$REPORT_FILE"
 echo "Report generation complete!" | tee -a "$REPORT_FILE"
 echo "Report saved to: $REPORT_FILE" | tee -a "$REPORT_FILE"
 [ -s "$SIZING_JSON" ] && echo "Structured sizing data saved to: $SIZING_JSON" | tee -a "$REPORT_FILE"
-[ -s "$USER_CSV" ] && echo "User export saved to: $USER_CSV" | tee -a "$REPORT_FILE"
-if [ "$total_secret_alerts" -gt 0 ] && [ -f "$SECRET_SCANNING_REPORT" ]; then
+[ "$EXPORT_USER_DETAILS" = "1" ] && [ -s "$USER_CSV" ] && \
+    echo "User export saved to: $USER_CSV (contains personal data - keep internal)" | tee -a "$REPORT_FILE"
+if [ "$EXPORT_SECRET_DETAILS" = "1" ] && [ "$total_secret_alerts" -gt 0 ] && [ -f "$SECRET_SCANNING_REPORT" ]; then
     echo "Secret scanning details saved to: $SECRET_SCANNING_REPORT" | tee -a "$REPORT_FILE"
     echo "Secret scanning CSV saved to: $SECRET_SCANNING_CSV" | tee -a "$REPORT_FILE"
     echo "Secret scanning JSON saved to: $SECRET_SCANNING_JSON" | tee -a "$REPORT_FILE"
