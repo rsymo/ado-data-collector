@@ -73,6 +73,21 @@ EXPORT_USER_DETAILS=${EXPORT_USER_DETAILS:-0}
 # EXPORT_SECRET_DETAILS=1 to additionally write the per-alert files, which also
 # costs one extra API call per alert.
 EXPORT_SECRET_DETAILS=${EXPORT_SECRET_DETAILS:-0}
+
+# HTTP behaviour. Azure DevOps allows 200 TSTUs per sliding five-minute window
+# per identity; a large estate is thousands of sequential calls, so being
+# throttled at some point is normal rather than exceptional.
+#   API_RETRIES        attempts after the first for a retryable failure. curl
+#                      honours the Retry-After header Azure DevOps returns.
+#   API_RETRY_MAX_TIME ceiling in seconds on the total time ONE call may spend
+#                      retrying. Without it a long Retry-After multiplied by the
+#                      retry count can stall a run for minutes per request.
+#   API_PACING_MS      fixed delay inserted before every request. Normally 0;
+#                      raise it to be deliberately gentle on a busy organization.
+#                      Pacing also escalates automatically once throttling starts.
+API_RETRIES=${API_RETRIES:-5}
+API_RETRY_MAX_TIME=${API_RETRY_MAX_TIME:-120}
+API_PACING_MS=${API_PACING_MS:-0}
 MULT_LINUX=${MULT_LINUX:-1}
 MULT_WINDOWS=${MULT_WINDOWS:-2}
 MULT_MACOS=${MULT_MACOS:-10}
@@ -107,7 +122,7 @@ unset _tool
 # a caller error that would otherwise yield a confident-looking report built on
 # a nonsense window (e.g. HISTORY_DAYS=abc silently becoming a 0-day window).
 # Fail fast so the mistake is corrected before anyone relies on the numbers.
-for _cfg in HISTORY_DAYS MAX_BUILDS_PER_PROJECT TOKEN_MAX_AGE TIMELINE_SAMPLE_MAX; do
+for _cfg in HISTORY_DAYS MAX_BUILDS_PER_PROJECT TOKEN_MAX_AGE TIMELINE_SAMPLE_MAX API_RETRY_MAX_TIME; do
     eval "_val=\${$_cfg}"
     case "$_val" in
         ''|*[!0-9]*)
@@ -119,6 +134,19 @@ for _cfg in HISTORY_DAYS MAX_BUILDS_PER_PROJECT TOKEN_MAX_AGE TIMELINE_SAMPLE_MA
         echo "ERROR: $_cfg must be at least 1 (got: '$_val')" >&2
         exit 1
     fi
+done
+unset _cfg _val
+
+# These two may legitimately be zero (no retries, no pacing), so they are
+# checked for "non-negative integer" rather than reusing the loop above.
+for _cfg in API_RETRIES API_PACING_MS; do
+    eval "_val=\${$_cfg}"
+    case "$_val" in
+        ''|*[!0-9]*)
+            echo "ERROR: $_cfg must be a non-negative integer (got: '$_val')" >&2
+            exit 1
+            ;;
+    esac
 done
 unset _cfg _val
 
@@ -382,8 +410,13 @@ refresh_token() {
         # Recreate curl config with new token
         create_curl_config
         TOKEN_ISSUED_AT=$(date +%s)
+        echo "$TOKEN_ISSUED_AT" > "$TOKEN_STATE_FILE"
         [ "$DEBUG" = "1" ] && echo "[DEBUG] Token refreshed successfully" >&2
     else
+        # Back off ~60s before trying again instead of leaving the clock stale.
+        # Without this a broken `az` would be re-invoked on every subsequent
+        # request for the rest of the run.
+        echo "$(( $(date +%s) - TOKEN_MAX_AGE + 60 ))" > "$TOKEN_STATE_FILE"
         [ "$DEBUG" = "1" ] && echo "[DEBUG] WARNING: Failed to refresh token, continuing with existing token" >&2
     fi
 }
@@ -394,13 +427,160 @@ refresh_token() {
 TOKEN_ISSUED_AT=$(date +%s)
 TOKEN_MAX_AGE=${TOKEN_MAX_AGE:-2400}
 
+# The token clock lives in a file, not just a variable. Requests are made inside
+# command substitution, so a refresh triggered by a request happens in a
+# subshell: the refreshed token itself propagates (it is written to the curl
+# config file), but a variable holding the issue time would not, and every later
+# request would then re-invoke `az`. This matters more now that a throttled run
+# can spend far longer inside a single section than the token's lifetime.
+TOKEN_STATE_FILE="$TEMP_DATA_DIR/token_issued_at"
+echo "$TOKEN_ISSUED_AT" > "$TOKEN_STATE_FILE"
+
 maybe_refresh_token() {
-    local now age
+    local now age issued
     now=$(date +%s)
-    age=$((now - TOKEN_ISSUED_AT))
+    issued=$(cat "$TOKEN_STATE_FILE" 2>/dev/null); : "${issued:=$TOKEN_ISSUED_AT}"
+    age=$((now - issued))
     if [ "$age" -ge "$TOKEN_MAX_AGE" ]; then
         refresh_token
     fi
+}
+
+# -------- HTTP TRANSPORT --------
+#
+# Every request goes through _http_exec, which exists to make one distinction
+# the original implementation could not: WHY a request failed.
+#
+# curl -f was removed deliberately. It suppresses the response body and exits 22
+# for every HTTP error alike, so a 429 ("slow down, try again") looked identical
+# to a 403 ("you will never be allowed to read this"). Those demand opposite
+# responses from the operator, and silently reporting a throttled endpoint as a
+# genuine zero is the most expensive mistake this tool can make. Status handling
+# is therefore explicit here: anything outside 2xx becomes API_ERROR, exactly as
+# before, but the status is recorded first.
+#
+# Throttling behaviour:
+#   - Azure DevOps returns Retry-After on 429 and curl honours it natively.
+#   - --retry-max-time bounds the total time a single call may spend retrying,
+#     so one long Retry-After cannot stall the run for minutes.
+#   - Every 429 escalates a process-wide inter-request delay, so a run that
+#     starts being throttled backs off instead of continuing to push against
+#     the limit.
+#
+# State lives in files, not variables: call_api is invoked through command
+# substitution, and a subshell cannot report anything back through a variable.
+
+HTTP_STATE_DIR="$TEMP_DATA_DIR/http"
+mkdir -p "$HTTP_STATE_DIR" 2>/dev/null
+HTTP_LAST_STATUS_FILE="$HTTP_STATE_DIR/last_status"
+HTTP_STATUS_LOG="$HTTP_STATE_DIR/status_log"      # one non-2xx status per line
+HTTP_THROTTLE_FILE="$HTTP_STATE_DIR/throttle_count"
+: > "$HTTP_STATUS_LOG"
+echo 0 > "$HTTP_THROTTLE_FILE"
+echo 0 > "$HTTP_LAST_STATUS_FILE"
+
+http_throttle_count() { cat "$HTTP_THROTTLE_FILE" 2>/dev/null || echo 0; }
+http_last_status()    { cat "$HTTP_LAST_STATUS_FILE" 2>/dev/null || echo 0; }
+
+# Plain-language cause for a status code. Used to make warnings actionable:
+# "rate-limited" and "permission denied" need completely different responses.
+http_status_hint() {
+    case "$1" in
+        429)     echo "rate-limited by Azure DevOps (HTTP 429) - the figure may be incomplete" ;;
+        401)     echo "authentication failed or the token expired (HTTP 401)" ;;
+        403)     echo "permission denied (HTTP 403)" ;;
+        404)     echo "not found (HTTP 404) - the resource or API version may not exist here" ;;
+        5??)     echo "Azure DevOps server error (HTTP $1)" ;;
+        000|0|"") echo "network failure, timeout, or no response" ;;
+        *)       echo "HTTP $1" ;;
+    esac
+}
+
+# Inter-request delay in seconds. Starts at API_PACING_MS and escalates as
+# throttling is observed, so the run slows itself down rather than being
+# throttled harder. It never decreases: once an organization has shown it will
+# throttle this identity, backing off again would just re-trigger it.
+_http_pace() {
+    local throttles base
+    throttles=$(http_throttle_count)
+    base="$API_PACING_MS"
+    if   [ "$throttles" -ge 11 ]; then [ "$base" -lt 2000 ] && base=2000
+    elif [ "$throttles" -ge 6 ];  then [ "$base" -lt 1000 ] && base=1000
+    elif [ "$throttles" -ge 3 ];  then [ "$base" -lt 500 ]  && base=500
+    elif [ "$throttles" -ge 1 ];  then [ "$base" -lt 250 ]  && base=250
+    fi
+    [ "$base" -le 0 ] && return 0
+    # Integer milliseconds -> fractional seconds without needing bc.
+    sleep "$((base / 1000)).$(printf '%03d' "$((base % 1000))")" 2>/dev/null
+}
+
+# Core transport. Echoes the response body, or the literal API_ERROR.
+#   $1 url   $2 max-time   $3 header dump file ("" for none)
+#   $4 method (GET|POST)   $5 POST body ("" for none)   $6 follow redirects (1|0)
+_http_exec() {
+    local url="$1" max_time="$2" hdr_file="$3" method="$4" data="$5" follow="$6"
+    local status rc body_file
+    local -a opts=()
+
+    # Defence in depth. Both callers already assert before calling, but this is
+    # now the single point through which every request in the tool passes, so
+    # re-asserting here means a future caller cannot bypass the read-only
+    # guarantee by forgetting to. Both assertions are idempotent.
+    if [ "$method" = "POST" ]; then
+        assert_read_only_query_url "$url"
+    else
+        assert_read_only_url "$url"
+    fi
+
+    # A long, throttled section can now outlive the token, so the check happens
+    # per request rather than only at section boundaries.
+    maybe_refresh_token
+    _http_pace
+
+    body_file=$(mktemp "$HTTP_STATE_DIR/body.XXXXXX") || { echo "API_ERROR"; return 0; }
+
+    [ "$follow" = "1" ] && opts+=(-L)
+    [ -n "$hdr_file" ] && opts+=(-D "$hdr_file")
+    if [ "$method" = "POST" ]; then
+        opts+=(-H "Content-Type: application/json" -X POST -d "$data")
+    else
+        opts+=(-X GET)
+    fi
+
+    # stdin is closed so a call made inside a `while read` loop cannot consume
+    # the loop's input.
+    status=$(curl -s --max-time "$max_time" \
+        --retry "$API_RETRIES" --retry-delay 1 --retry-max-time "$API_RETRY_MAX_TIME" \
+        "${CURL_SAFE_OPTS[@]}" \
+        --config "$CURL_CONFIG_FILE" \
+        "${opts[@]}" \
+        -o "$body_file" -w '%{http_code}' \
+        "$url" 2>/dev/null </dev/null)
+    rc=$?
+    [ -z "$status" ] && status=0
+
+    echo "$status" > "$HTTP_LAST_STATUS_FILE"
+
+    case "$status" in
+        2??)
+            cat "$body_file"
+            rm -f "$body_file"
+            return 0
+            ;;
+    esac
+
+    # Record the failure class so the end of the run can explain what went wrong
+    # rather than leaving a wall of zeros with no cause.
+    echo "$status" >> "$HTTP_STATUS_LOG"
+    if [ "$status" = "429" ]; then
+        echo "$(( $(http_throttle_count) + 1 ))" > "$HTTP_THROTTLE_FILE"
+        [ "$DEBUG" = "1" ] && echo "[DEBUG] throttled (429), pacing escalated: $url" >&2
+    fi
+    [ "$DEBUG" = "1" ] && echo "[DEBUG] HTTP $status (curl rc=$rc): $url" >&2
+
+    rm -f "$body_file"
+    echo "API_ERROR"
+    return 0
 }
 
 # Function to make Azure DevOps API calls (GET requests)
@@ -411,13 +591,7 @@ call_api() {
     local endpoint="$1"
     assert_read_only_url "$endpoint"
     [ "$DEBUG" = "1" ] && echo "[DEBUG] GET: $endpoint" >&2
-    # stdin is closed so that a call made inside a `while read` loop cannot
-    # consume the loop's input.
-    curl -s -f -L --max-time 30 --retry 2 --retry-delay 1 \
-        "${CURL_SAFE_OPTS[@]}" \
-        --config "$CURL_CONFIG_FILE" \
-        -X GET \
-        "$endpoint" 2>/dev/null </dev/null || echo "API_ERROR"
+    _http_exec "$endpoint" 30 "" GET "" 1
 }
 
 # Function to run a read-only Azure DevOps query that the API only exposes over
@@ -433,11 +607,11 @@ call_api_readonly_query() {
     local data="$2"
     assert_read_only_query_url "$endpoint"
     [ "$DEBUG" = "1" ] && echo "[DEBUG] POST (read-only query): $endpoint" >&2
-    curl -s -f --max-time 30 --retry 2 --retry-delay 1 \
-        "${CURL_SAFE_OPTS[@]}" \
-        --config "$CURL_CONFIG_FILE" \
-        -H "Content-Type: application/json" \
-        -X POST -d "$data" "$endpoint" 2>/dev/null || echo "API_ERROR"
+    # Redirects are NOT followed here (final argument 0). This is the only
+    # request in the tool that carries a body, and replaying that body against
+    # a redirect target would send the query somewhere the read-only allow-list
+    # never vetted.
+    _http_exec "$endpoint" 30 "" POST "$data" 0
 }
 
 # Function to safely extract a numeric value from JSON.
@@ -562,9 +736,7 @@ call_api_paged() {
         : > "$hdr_file"
         local body
         assert_read_only_url "$url"
-        body=$(curl -s -f -L --max-time 60 --retry 2 --retry-delay 1 \
-            "${CURL_SAFE_OPTS[@]}" \
-            --config "$CURL_CONFIG_FILE" -D "$hdr_file" -X GET "$url" 2>/dev/null) || body="API_ERROR"
+        body=$(_http_exec "$url" 60 "$hdr_file" GET "" 1)
 
         # A failure here is invisible to the caller: it just receives fewer
         # records, or none. Both cases must be recorded, because a permission
@@ -572,10 +744,12 @@ call_api_paged() {
         # reporting "0 service connections to migrate" when the account simply
         # could not read them is the most expensive mistake this tool can make.
         if [ "$body" = "API_ERROR" ] || ! echo "$body" | jq empty 2>/dev/null; then
+            local why
+            why=$(http_status_hint "$(http_last_status)")
             if [ "$page" -gt 0 ]; then
-                report_warn "Pagination failed on page $page for ${endpoint%%\?*} - results are TRUNCATED"
+                report_warn "Pagination failed on page $page for ${endpoint%%\?*} - $why - results are TRUNCATED"
             else
-                report_warn "No data read from ${endpoint%%\?*} - the request failed (auth, permission, or endpoint unavailable). This section reads as ZERO; confirm it is genuinely zero before sizing from it."
+                report_warn "No data read from ${endpoint%%\?*} - $why. This section reads as ZERO; confirm it is genuinely zero before sizing from it."
             fi
             break
         fi
@@ -3676,6 +3850,8 @@ jq -n \
   --slurpfile connTypes <(jq 'group_by(.type) | map({type: .[0].type, count: length}) | sort_by(-.count)' "${SERVICE_CONN_FILE:-/dev/null}" 2>/dev/null || echo '[]') \
   --slurpfile extList <(jq 'map({publisher, name})' "${EXTENSIONS_FILE:-/dev/null}" 2>/dev/null || echo '[]') \
   --slurpfile warnList <(jq -R -s 'split("\n") | map(select(length > 0))' "${WARNINGS_FILE:-/dev/null}" 2>/dev/null || echo '[]') \
+  --argjson throttled "$(num "$(http_throttle_count)")" \
+  --slurpfile httpErrors <(jq -R -s 'split("\n") | map(select(length > 0)) | group_by(.) | map({status: .[0], count: length}) | sort_by(-.count)' "${HTTP_STATUS_LOG:-/dev/null}" 2>/dev/null || echo '[]') \
   '{
     meta: {
       organization: $org,
@@ -3684,7 +3860,9 @@ jq -n \
       historyStart: $historyStart,
       dataComplete: ((($warnList[0] // []) | length) == 0),
       warnings: ($warnList[0] // []),
-      schemaVersion: "1.1"
+      throttledRequests: $throttled,
+      failedRequestsByStatus: ($httpErrors[0] // []),
+      schemaVersion: "1.2"
     },
     content: {
       projects: $projects,
@@ -3862,6 +4040,28 @@ else
     while IFS= read -r w; do
         [ -n "$w" ] && echo "  - $w" | tee -a "$REPORT_FILE"
     done < "$WARNINGS_FILE"
+fi
+
+# API health. Throttling is the one failure mode that is entirely recoverable
+# by re-running, so it is separated from permission errors (which are not) to
+# stop an operator concluding the tool "does not work" when it simply needs a
+# quieter moment or a narrower window.
+throttle_total=$(num "$(http_throttle_count)")
+http_fail_total=$(num "$(grep -c . "$HTTP_STATUS_LOG" 2>/dev/null)")
+if [ "$http_fail_total" -gt 0 ]; then
+    echo "" | tee -a "$REPORT_FILE"
+    echo "API request failures by cause:" | tee -a "$REPORT_FILE"
+    sort "$HTTP_STATUS_LOG" 2>/dev/null | uniq -c | sort -rn | while read -r c code; do
+        echo "  $c x $(http_status_hint "$code")" | tee -a "$REPORT_FILE"
+    done
+    if [ "$throttle_total" -gt 0 ]; then
+        echo "" | tee -a "$REPORT_FILE"
+        echo "  Azure DevOps rate-limited $throttle_total request(s). The collector" | tee -a "$REPORT_FILE"
+        echo "  automatically slowed itself down and retried, but any section that" | tee -a "$REPORT_FILE"
+        echo "  still reported a warning above may be understated." | tee -a "$REPORT_FILE"
+        echo "  To reduce throttling, re-run at a quieter time, lower HISTORY_DAYS," | tee -a "$REPORT_FILE"
+        echo "  or set API_PACING_MS=250 to pace requests from the start." | tee -a "$REPORT_FILE"
+    fi
 fi
 
 echo "" | tee -a "$REPORT_FILE"

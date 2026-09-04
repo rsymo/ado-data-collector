@@ -91,6 +91,9 @@ ORG="your-org-name" HISTORY_DAYS=7 DEBUG=1 ./ado-data-collector.sh
 | `MULT_WINDOWS` | `2` | Cost weighting for Windows job minutes |
 | `MULT_MACOS` | `10` | Cost weighting for macOS job minutes. Defaults reflect GitHub-hosted standard runner ratios at the time of writing — confirm against current pricing |
 | `TOKEN_MAX_AGE` | `2400` | Seconds before the Azure AD token is refreshed |
+| `API_RETRIES` | `5` | Retry attempts for a rate-limited or transient request |
+| `API_RETRY_MAX_TIME` | `120` | Ceiling in seconds on the total time any single request may spend retrying |
+| `API_PACING_MS` | `0` | Fixed delay before every request. Raise it (for example `250`) to pace a large run from the start |
 | `DEBUG` | `0` | Print API calls and diagnostic details |
 
 `SKIP_BUILD_HISTORY=1` makes the run faster, but removes build activity and runner-sizing data. Increase `HISTORY_DAYS` for quarterly or annual pipelines; otherwise they can appear dormant simply because they did not run during the selected window.
@@ -168,6 +171,38 @@ jq '{
   dormantPipelines: .migrationEffort.buildPipelines.dormant
 }' ado-sizing-*.json
 ```
+
+## Rate limiting
+
+Azure DevOps applies a usage limit per identity (a sliding five-minute window),
+and a large organization is many thousands of sequential requests. Being
+throttled at some point during a full run is normal.
+
+The collector is designed to absorb this rather than fail:
+
+- Requests are made **one at a time**. The tool never runs parallel requests, so
+  it will not saturate the limit on its own account or degrade Azure DevOps for
+  anyone else in the organization.
+- When Azure DevOps returns `429`, it also returns a `Retry-After` header. The
+  collector honours that header and retries, so most throttling is invisible and
+  self-correcting.
+- Repeated throttling **automatically slows the whole run down**, increasing the
+  delay between requests so the tool stops pushing against the limit.
+- Every retry is time-bounded (`API_RETRY_MAX_TIME`), so a single unlucky
+  request cannot stall the run indefinitely.
+
+If throttling did occur, the report says so explicitly under **Data
+completeness**, separating rate limiting (recoverable - re-run and it will
+likely succeed) from permission errors (not recoverable without more access).
+The JSON export records the same detail in `meta.throttledRequests` and
+`meta.failedRequestsByStatus`.
+
+If a run is heavily throttled, any of these will help:
+
+- Re-run at a quieter time of day.
+- Lower `HISTORY_DAYS` to narrow the build window.
+- Set `API_PACING_MS=250` to pace requests deliberately from the start. This
+  makes the run slower but markedly less likely to be throttled.
 
 ## Trust and limitations
 
