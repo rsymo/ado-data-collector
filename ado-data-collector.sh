@@ -50,7 +50,7 @@ HISTORY_DAYS=${HISTORY_DAYS:-90}
 # Maximum builds to retrieve per project (guards against very large orgs)
 MAX_BUILDS_PER_PROJECT=${MAX_BUILDS_PER_PROJECT:-20000}
 # Set SKIP_TIMELINE=1 to skip per-build timeline collection. Timelines are the
-# only source of JOB-level durations, which is the unit GitHub Actions bills on.
+# only source of JOB-level durations, the unit per-job models bill on.
 # Leave it enabled unless the run must be fast.
 SKIP_TIMELINE=${SKIP_TIMELINE:-0}
 # Ceiling on how many builds have their timeline fetched. The collector samples
@@ -1012,7 +1012,7 @@ if [ "$SCAN_LARGE_FILES" = "1" ] && command -v git &> /dev/null; then
                 cd repo.git
                 
                 # Capture distinct commit authors in the history window. Unique
-                # committers are the billing unit for GitHub Advanced Security,
+                # committer counts are a common licensing unit for security tooling,
                 # so this is collected while the clone is already local.
                 git log --all --since="${HISTORY_DAYS} days ago" --format='%ae' 2>/dev/null \
                     | tr '[:upper:]' '[:lower:]' \
@@ -1056,8 +1056,9 @@ if [ "$SCAN_LARGE_FILES" = "1" ] && command -v git &> /dev/null; then
     
     if [ "$total_large_files" -gt 0 ]; then
         echo "" | tee -a "$REPORT_FILE"
-        echo "NOTE: GitHub warns about files >50MB and blocks files >100MB." | tee -a "$REPORT_FILE"
-        echo "Consider using Git LFS for these files during migration." | tee -a "$REPORT_FILE"
+        echo "NOTE: most Git hosts enforce a per-file size limit, commonly a" | tee -a "$REPORT_FILE"
+        echo "warning around 50MB and a hard block around 100MB. Large binaries" | tee -a "$REPORT_FILE"
+        echo "also slow every clone and fetch. Git LFS is the usual remedy." | tee -a "$REPORT_FILE"
     fi
     
 else
@@ -1076,10 +1077,10 @@ else
     echo "  2. Use Azure Repos web interface to browse repository contents" | tee -a "$REPORT_FILE"
     echo "  3. Check if Git LFS is already configured: git lfs ls-files" | tee -a "$REPORT_FILE"
     echo "" | tee -a "$REPORT_FILE"
-    echo "GitHub migration considerations:" | tee -a "$REPORT_FILE"
-    echo "  - GitHub warns about files >50MB" | tee -a "$REPORT_FILE"
-    echo "  - GitHub blocks files >100MB" | tee -a "$REPORT_FILE"
-    echo "  - Consider using Git LFS for binary files and large assets" | tee -a "$REPORT_FILE"
+    echo "Why this matters:" | tee -a "$REPORT_FILE"
+    echo "  - most Git hosts warn above ~50MB and block above ~100MB per file" | tee -a "$REPORT_FILE"
+    echo "  - large binaries slow every clone, fetch and CI checkout" | tee -a "$REPORT_FILE"
+    echo "  - Git LFS is the usual remedy for binary files and large assets" | tee -a "$REPORT_FILE"
     echo "" | tee -a "$REPORT_FILE"
     
     # Initialize variables for summary
@@ -1097,7 +1098,7 @@ fi
 # ========================================
 # 7. METADATA DATA
 # ========================================
-write_section "7. Metadata Data"
+write_section "7. Work Items, Pull Requests & Project Metadata"
 
 echo "Checking for work items, pull requests, and boards..." | tee -a "$REPORT_FILE"
 
@@ -1209,7 +1210,7 @@ for project in "${projects[@]}"; do
             createdOn: (.createdOn // null)
           }' >> "$TEMP_DATA_DIR/release_defs.ndjson" 2>/dev/null
 
-    # Task groups have no GitHub equivalent - each becomes a composite action
+    # Task groups rarely port directly - each becomes a reusable unit
     # or reusable workflow, so the count is a direct effort input.
     call_api_paged \
         "$ORG_URL/$project_encoded/_apis/distributedtask/taskgroups?api-version=7.1-preview.1" \
@@ -1591,8 +1592,9 @@ else
     echo "  - Dependency scanning (vulnerable packages)" | tee -a "$REPORT_FILE"
     echo "  - Code scanning (security vulnerabilities)" | tee -a "$REPORT_FILE"
     echo "" | tee -a "$REPORT_FILE"
-    echo "Alternative: Consider using third-party security scanning tools or" | tee -a "$REPORT_FILE"
-    echo "GitHub Advanced Security after migration." | tee -a "$REPORT_FILE"
+    echo "If scanning coverage is a requirement, it is currently being met by" | tee -a "$REPORT_FILE"
+    echo "third-party tooling in the pipelines, or not at all. Section 10 lists" | tee -a "$REPORT_FILE"
+    echo "the security extensions actually in use." | tee -a "$REPORT_FILE"
 fi
 
 # ========================================
@@ -1741,7 +1743,7 @@ if [ "$user_count" -gt 0 ]; then
 
     # Activity windows. lastAccessedDate is unset (year 0001) for users who
     # have never signed in - those are pure licence waste and should not be
-    # carried into the GitHub seat count.
+    # carried into the seat count on a platform without a free tier.
     active_30=$(jq --arg c "$(iso_days_ago 30)" \
         '[.[] | select((.lastAccessedDate // "") > $c)] | length' "$USERS_FILE")
     active_60=$(jq --arg c "$(iso_days_ago 60)" \
@@ -1770,10 +1772,11 @@ if [ "$user_count" -gt 0 ]; then
     echo "  Active (90d) users:           $active_90" | tee -a "$REPORT_FILE"
     echo "  Stakeholder users:            $stakeholder_count" | tee -a "$REPORT_FILE"
     echo "" | tee -a "$REPORT_FILE"
-    echo "  IMPORTANT: Stakeholder access is free in Azure DevOps but has no" | tee -a "$REPORT_FILE"
-    echo "  free equivalent on GitHub - every Stakeholder who needs access" | tee -a "$REPORT_FILE"
-    echo "  becomes a paid GitHub Enterprise seat. This is the most common" | tee -a "$REPORT_FILE"
-    echo "  source of budget surprise in ADO-to-GitHub licensing models." | tee -a "$REPORT_FILE"
+    echo "  NOTE: Stakeholder access is free in Azure DevOps. Most other" | tee -a "$REPORT_FILE"
+    echo "  platforms have no equivalent free tier, so Stakeholders who still" | tee -a "$REPORT_FILE"
+    echo "  need access can convert to paid seats under a different licensing" | tee -a "$REPORT_FILE"
+    echo "  model. They are counted separately here so seat planning can test" | tee -a "$REPORT_FILE"
+    echo "  that assumption rather than inherit it." | tee -a "$REPORT_FILE"
 
     # Per-user detail is personal data (names and email addresses) and is not
     # needed for estate sizing or cost modelling - the counts above already
@@ -1807,8 +1810,8 @@ else
     echo "  permissions on the organization." | tee -a "$REPORT_FILE"
 fi
 
-# Unique committers over the history window - the billing unit for GitHub
-# Advanced Security. Only available when repositories were cloned.
+# Unique committers over the history window - a common licensing unit for
+# security and code-quality tooling. Only available when repositories were cloned.
 unique_committers=0
 if [ "$SCAN_LARGE_FILES" = "1" ] && [ -f "$TEMP_DATA_DIR/committers.txt" ]; then
     # `grep -c .` prints 0 AND exits 1 on no match, so a `|| echo 0` fallback
@@ -1818,7 +1821,9 @@ if [ "$SCAN_LARGE_FILES" = "1" ] && [ -f "$TEMP_DATA_DIR/committers.txt" ]; then
     unique_committers=$(num "$unique_committers")
     echo "" | tee -a "$REPORT_FILE"
     echo "Unique Committers (last $HISTORY_DAYS days): $unique_committers" | tee -a "$REPORT_FILE"
-    echo "  This is the billing unit for GitHub Advanced Security." | tee -a "$REPORT_FILE"
+    echo "  Security and code-quality products are often licensed per active" | tee -a "$REPORT_FILE"
+    echo "  committer rather than per user, so this is usually a smaller and" | tee -a "$REPORT_FILE"
+    echo "  more accurate seat count than total provisioned users." | tee -a "$REPORT_FILE"
 else
     echo "" | tee -a "$REPORT_FILE"
     echo "Unique Committers: not collected (re-run with SCAN_LARGE_FILES=1)" | tee -a "$REPORT_FILE"
@@ -2059,8 +2064,8 @@ else
 
         echo "" | tee -a "$REPORT_FILE"
         echo "SIZING CAVEAT: the minutes above are BUILD wall-clock time, which is" | tee -a "$REPORT_FILE"
-        echo "  not the unit GitHub Actions bills on. Actions bills per JOB and" | tee -a "$REPORT_FILE"
-        echo "  rounds each job up to the next whole minute, so a build running" | tee -a "$REPORT_FILE"
+        echo "  not the unit per-job billing models charge on. Those bill per JOB" | tee -a "$REPORT_FILE"
+        echo "  and round each job up to a whole minute, so a build running" | tee -a "$REPORT_FILE"
         echo "  four jobs in parallel bills roughly four times its wall-clock." | tee -a "$REPORT_FILE"
         echo "  Multipliers then apply (Windows ${MULT_WINDOWS}x, macOS ${MULT_MACOS}x against Linux)." | tee -a "$REPORT_FILE"
         echo "  Section 16 measures the job-level figure; section 17 measures the" | tee -a "$REPORT_FILE"
@@ -2148,7 +2153,7 @@ if [ "$total_agents" -gt 0 ]; then
            | "  - \(.pool): \(.agents) agents (\(.online) online)"' \
         "$AGENTS_FILE" | tee -a "$REPORT_FILE"
 
-    # Agent size is what an equivalent GitHub-hosted or ARC runner has to match,
+    # Agent size is what an equivalent hosted or self-hosted runner must match,
     # and is the multiplier on the self-hosted infrastructure cost you supply
     # from your own cloud or datacentre billing. Reported from agent-declared capabilities, which are only
     # present for agents that have connected at least once.
@@ -2175,25 +2180,33 @@ if [ "$total_agents" -gt 0 ]; then
 fi
 
 echo "" | tee -a "$REPORT_FILE"
-echo "GitHub equivalent: Microsoft-hosted pools map to GitHub-hosted runners" | tee -a "$REPORT_FILE"
-echo "  (per-minute billing). Self-hosted pools map to either self-hosted" | tee -a "$REPORT_FILE"
-echo "  runners or Actions Runner Controller (ARC) on Kubernetes - no GitHub" | tee -a "$REPORT_FILE"
-echo "  compute charge, but you keep the infrastructure cost." | tee -a "$REPORT_FILE"
-echo "  Peak concurrency (section 12) sizes the runner fleet; total minutes" | tee -a "$REPORT_FILE"
-echo "  size the GitHub-hosted spend." | tee -a "$REPORT_FILE"
+echo "Reading this for a platform comparison:" | tee -a "$REPORT_FILE"
+echo "  Microsoft-hosted pools are vendor-run compute, normally billed per" | tee -a "$REPORT_FILE"
+echo "  minute. Their usage carries over as metered spend on any hosted-runner" | tee -a "$REPORT_FILE"
+echo "  model. Self-hosted pools carry no vendor compute charge on either side," | tee -a "$REPORT_FILE"
+echo "  but the underlying infrastructure cost stays with you and does not" | tee -a "$REPORT_FILE"
+echo "  appear in any vendor quote." | tee -a "$REPORT_FILE"
+echo "  Peak concurrency (section 12) sizes the fleet; total minutes size the" | tee -a "$REPORT_FILE"
+echo "  hosted-compute portion." | tee -a "$REPORT_FILE"
 
 # ========================================
-# 14. ADO TO GITHUB CAPABILITY MAPPING
+# 14. INTEGRATION REPLACEMENT EFFORT
 # ========================================
-write_section "14. Azure DevOps to GitHub Capability Mapping"
+write_section "14. Integration Replacement Effort"
 
-echo "Mapping detected integrations to GitHub equivalents..." | tee -a "$REPORT_FILE"
+echo "Classifying each detected integration by how much work it would take to" | tee -a "$REPORT_FILE"
+echo "reproduce on a different CI platform." | tee -a "$REPORT_FILE"
 echo "" | tee -a "$REPORT_FILE"
 echo "Effort categories:" | tee -a "$REPORT_FILE"
-echo "  OOB     - supported out of the box by a GitHub feature" | tee -a "$REPORT_FILE"
-echo "  MARKET  - GitHub Marketplace action exists" | tee -a "$REPORT_FILE"
-echo "  PARTNER - publisher provides a supported GitHub App or action" | tee -a "$REPORT_FILE"
-echo "  CUSTOM  - no direct equivalent; expect bespoke work" | tee -a "$REPORT_FILE"
+echo "  OOB     - a native platform feature covers it; no integration work" | tee -a "$REPORT_FILE"
+echo "  MARKET  - an off-the-shelf marketplace component exists" | tee -a "$REPORT_FILE"
+echo "  PARTNER - the publisher ships and supports its own integration" | tee -a "$REPORT_FILE"
+echo "  CUSTOM  - no ready-made equivalent; expect bespoke work" | tee -a "$REPORT_FILE"
+echo "" | tee -a "$REPORT_FILE"
+echo "The category is the portable finding. The named component after each" | tee -a "$REPORT_FILE"
+echo "entry is a worked example against GitHub Actions, included to show why" | tee -a "$REPORT_FILE"
+echo "the item was graded that way - substitute the equivalent for whichever" | tee -a "$REPORT_FILE"
+echo "platform you are evaluating." | tee -a "$REPORT_FILE"
 echo "" | tee -a "$REPORT_FILE"
 
 map_service_connection() {
@@ -2293,7 +2306,7 @@ tally_category() {
 }
 
 if [ "${total_service_connections:-0}" -gt 0 ]; then
-    echo "Service Connection Mapping:" | tee -a "$REPORT_FILE"
+    echo "Service Connections:" | tee -a "$REPORT_FILE"
     while IFS='|' read -r conn_type conn_count; do
         [ -z "$conn_type" ] && continue
         mapping=$(map_service_connection "$conn_type")
@@ -2308,7 +2321,7 @@ if [ "${total_service_connections:-0}" -gt 0 ]; then
 fi
 
 if [ "${total_extensions:-0}" -gt 0 ]; then
-    echo "Marketplace Extension Mapping:" | tee -a "$REPORT_FILE"
+    echo "Marketplace Extensions:" | tee -a "$REPORT_FILE"
     while IFS= read -r ext_id; do
         [ -z "$ext_id" ] && continue
         mapping=$(map_extension "$(echo "$ext_id" | tr '[:upper:]' '[:lower:]')")
@@ -2327,8 +2340,8 @@ if [ "$total_mapped" -gt 0 ]; then
     echo "Integration Effort Summary (counted per distinct integration type," | tee -a "$REPORT_FILE"
     echo "not per instance - solving a type once covers all its instances):" | tee -a "$REPORT_FILE"
     echo "  Out of the box (no work):        $oob_count" | tee -a "$REPORT_FILE"
-    echo "  GitHub Marketplace action:       $market_count" | tee -a "$REPORT_FILE"
-    echo "  Partner / third-party action:    $partner_count" | tee -a "$REPORT_FILE"
+    echo "  Off-the-shelf component:         $market_count" | tee -a "$REPORT_FILE"
+    echo "  Publisher-supported integration: $partner_count" | tee -a "$REPORT_FILE"
     echo "  Custom build / needs assessment: $custom_count" | tee -a "$REPORT_FILE"
 
     if [ -s "$CUSTOM_ITEMS_FILE" ]; then
@@ -2429,7 +2442,7 @@ selfhosted_parallel_used=0
 # ========================================
 # 16. JOB-LEVEL COMPUTE & BILLABLE MINUTES
 # ========================================
-write_section "16. Job-Level Compute & Billable Minutes (Actions billing model)"
+write_section "16. Job-Level Compute & Billable Minutes (per-job billing model)"
 maybe_refresh_token
 
 # Section 12 measures BUILD wall-clock, which is what Azure DevOps reports.
@@ -2467,7 +2480,7 @@ unset _f
 if [ "$SKIP_BUILD_HISTORY" = "1" ]; then
     echo "Skipped: build history was not collected (SKIP_BUILD_HISTORY=1)." | tee -a "$REPORT_FILE"
     echo "Job-level minutes require build history. Re-run without that flag to" | tee -a "$REPORT_FILE"
-    echo "produce a figure that can be priced against GitHub Actions." | tee -a "$REPORT_FILE"
+    echo "produce a figure comparable to a per-job billing model." | tee -a "$REPORT_FILE"
 elif [ "$SKIP_TIMELINE" = "1" ]; then
     echo "Skipped: SKIP_TIMELINE=1." | tee -a "$REPORT_FILE"
     echo "Without this section the only compute figure available is build" | tee -a "$REPORT_FILE"
@@ -2732,7 +2745,7 @@ fi
 write_section "17. Runner Image & Operating System Mix"
 maybe_refresh_token
 
-# Total minutes alone cannot be priced: GitHub Actions charges Linux at 1x,
+# Total minutes alone cannot be priced: per-job models weight Linux at 1x,
 # Windows at 2x and macOS at 10x. The agent job-request queue is the only
 # endpoint that reports the image each job actually ran on, so it is the only
 # source for the multiplier weighting.
@@ -3326,7 +3339,7 @@ echo "  EXTRAPOLATED - measured on a sample, scaled to the estate" | tee -a "$RE
 echo "  UNKNOWN      - not exposed by the API; supply it yourself" | tee -a "$REPORT_FILE"
 echo "" | tee -a "$REPORT_FILE"
 
-echo "A. COMPUTE - what GitHub Actions would bill" | tee -a "$REPORT_FILE"
+echo "A. COMPUTE - inputs to a per-job billing model" | tee -a "$REPORT_FILE"
 echo "----------------------------------------------------------------" | tee -a "$REPORT_FILE"
 printf '  %-46s %12s  %s\n' "Build wall-clock minutes / month" "${minutes_per_month:-0}" "MEASURED" | tee -a "$REPORT_FILE"
 if [ "${timeline_sampled:-0}" -gt 0 ]; then
@@ -3370,8 +3383,8 @@ echo "----------------------------------------------------------------" | tee -a
 printf '  %-46s %12s  %s\n' "Total users" "${user_count:-0}" "MEASURED" | tee -a "$REPORT_FILE"
 printf '  %-46s %12s  %s\n' "Active users (90 days)" "${active_90:-0}" "MEASURED" | tee -a "$REPORT_FILE"
 printf '  %-46s %12s  %s\n' "Never signed in" "${never_accessed:-0}" "MEASURED" | tee -a "$REPORT_FILE"
-printf '  %-46s %12s  %s\n' "Stakeholders (become paid GitHub seats)" "${stakeholder_count:-0}" "MEASURED" | tee -a "$REPORT_FILE"
-printf '  %-46s %12s  %s\n' "Unique committers (GHAS billing unit)" "${unique_committers:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Stakeholders (free in ADO, often paid elsewhere)" "${stakeholder_count:-0}" "MEASURED" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Unique committers (committer-licensing unit)" "${unique_committers:-0}" "MEASURED" | tee -a "$REPORT_FILE"
 
 echo "" | tee -a "$REPORT_FILE"
 echo "D. CURRENT AZURE DEVOPS BASELINE" | tee -a "$REPORT_FILE"
@@ -3416,8 +3429,8 @@ echo "     after retiring the ${dead_pipelines:-0} dormant pipelines." | tee -a 
 echo "  5. Workloads that cannot move for compliance, networking or technical" | tee -a "$REPORT_FILE"
 echo "     reasons, and therefore stay on self-hosted runners." | tee -a "$REPORT_FILE"
 echo "  6. Whether migration and professional services are in or out of scope." | tee -a "$REPORT_FILE"
-echo "  7. The GitHub Actions unit rates current at the time of your analysis," | tee -a "$REPORT_FILE"
-echo "     plus any other vendor quotes you are comparing against." | tee -a "$REPORT_FILE"
+echo "  7. The unit rates current at the time of your analysis for whichever" | tee -a "$REPORT_FILE"
+echo "     platforms you are comparing, plus any vendor quotes held." | tee -a "$REPORT_FILE"
 if [ "$(num "${jobreq_total:-0}")" -eq 0 ]; then
     echo "  8. The Windows, Linux and macOS split of pipeline minutes - this could" | tee -a "$REPORT_FILE"
     echo "     not be measured and is the largest single cost variable." | tee -a "$REPORT_FILE"
@@ -3516,8 +3529,8 @@ echo "--- 2. Licensing ---" | tee -a "$REPORT_FILE"
 echo "Total Users: $user_count" | tee -a "$REPORT_FILE"
 echo "Active users (90d): ${active_90:-0}" | tee -a "$REPORT_FILE"
 echo "Never signed in: ${never_accessed:-0}" | tee -a "$REPORT_FILE"
-echo "Stakeholder users (become paid GitHub seats): ${stakeholder_count:-0}" | tee -a "$REPORT_FILE"
-echo "Unique committers (GHAS billing unit): ${unique_committers:-0}" | tee -a "$REPORT_FILE"
+echo "Stakeholder users (free in ADO): ${stakeholder_count:-0}" | tee -a "$REPORT_FILE"
+echo "Unique committers: ${unique_committers:-0}" | tee -a "$REPORT_FILE"
 
 echo "" | tee -a "$REPORT_FILE"
 echo "--- 3. Migration Effort (ADO transform) ---" | tee -a "$REPORT_FILE"
@@ -3530,13 +3543,13 @@ echo "Variable Groups: ${total_vargroups:-0}" | tee -a "$REPORT_FILE"
 echo "Repositories with Pipelines: $repos_with_pipelines" | tee -a "$REPORT_FILE"
 
 echo "" | tee -a "$REPORT_FILE"
-echo "--- 4. Integrations & GitHub Apps ---" | tee -a "$REPORT_FILE"
+echo "--- 4. Integrations & Extensions ---" | tee -a "$REPORT_FILE"
 echo "Service Connections: ${total_service_connections:-0}" | tee -a "$REPORT_FILE"
 echo "Marketplace Extensions: ${total_extensions:-0}" | tee -a "$REPORT_FILE"
 echo "Service Hooks: $total_hooks" | tee -a "$REPORT_FILE"
-echo "Mapped out-of-the-box: ${oob_count:-0}" | tee -a "$REPORT_FILE"
-echo "Mapped to Marketplace action: ${market_count:-0}" | tee -a "$REPORT_FILE"
-echo "Mapped to Partner App: ${partner_count:-0}" | tee -a "$REPORT_FILE"
+echo "Native platform feature: ${oob_count:-0}" | tee -a "$REPORT_FILE"
+echo "Off-the-shelf component: ${market_count:-0}" | tee -a "$REPORT_FILE"
+echo "Publisher-supported: ${partner_count:-0}" | tee -a "$REPORT_FILE"
 echo "Needing custom work: ${custom_count:-0}" | tee -a "$REPORT_FILE"
 
 echo "" | tee -a "$REPORT_FILE"

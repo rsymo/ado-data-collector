@@ -102,16 +102,16 @@ The generated `ado-data-report-RUN.txt` contains these sections:
 | Sections | What to look for |
 |---|---|
 | 1–6: Repositories | Project and repository totals, public repositories, repositories over 1 GB, the largest and oldest repositories, and optional files over 50 MB |
-| 7: ADO metadata | Work items, pull requests, and projects with boards or teams |
+| 7: Work items and PRs | Work items, pull requests, and projects with boards or teams |
 | 8: Pipelines | YAML versus Classic, disabled pipelines, non-Azure-Repos sources, Classic release pipelines, task groups, variable groups, Key Vault-backed groups, and pipeline counts by project |
 | 9: Security | Advanced Security status and secret, dependency, and code-scanning alerts |
 | 10: Integrations | Service hooks, service connections, and installed Marketplace extensions |
 | 11: Users | Total users, access levels, license source, sign-in recency, stakeholders, likely service accounts, and unique committers |
 | 12: Build activity | Builds and compute minutes, duration and queue-time percentiles, outcomes, pool usage, concurrency, and dormant pipelines |
 | 13: Agents | Microsoft-hosted and self-hosted pools, registered/online/enabled agents, operating systems, and per-pool details |
-| 14: Capability mapping | Integrations grouped as `OOB`, `MARKET`, `PARTNER`, or `CUSTOM` |
+| 14: Integration replacement effort | Each integration graded `OOB`, `MARKET`, `PARTNER` or `CUSTOM` by how hard it would be to reproduce elsewhere, so bespoke work can be identified early |
 | 15: Platform denominators | Estate scale, change volume, and support surface for planning team capacity |
-| 16: Job-level compute | Billable job minutes in the Actions model, the job-to-wall-clock expansion ratio, average jobs per build, and the tasks and Marketplace extensions actually executed |
+| 16: Job-level compute | Billable job minutes under a per-job model, the job-to-wall-clock expansion ratio, average jobs per build, and the tasks and Marketplace extensions actually executed |
 | 17: Runner image and OS mix | Windows, Linux and macOS split of job minutes, the weighted cost multiplier, hosted versus self-hosted, and the top runner images |
 | 18: Deployment compute | Classic release deployment minutes, which are additional to build minutes and invisible to the build API |
 | 19: Approvals, gates and secrets | YAML environment checks, classic release approvals and gates, secret variables, secure files and service connections — all manual rebuild work |
