@@ -700,6 +700,42 @@ report_warn() {
     fi
 }
 
+# Record a read that failed and then degraded to a zero.
+#
+# Every call_api caller already tests for API_ERROR, but most respond by
+# substituting 0 or skipping the record, which is indistinguishable in the
+# finished report from a genuine zero. call_api_paged has always warned in this
+# situation; the single-request path never did, so a section could print a
+# confident total built entirely on failed requests.
+#
+# Many of these endpoints are called once per project or per repository, so one
+# permission boundary or unsupported API version can fail dozens of times.
+# Warning on every occurrence would bury the report, so this warns once per
+# distinct context and status while tallying every occurrence, letting the DATA
+# COMPLETENESS section report the true scale.
+#
+# Writes nothing to stdout: several call sites sit inside command substitution
+# or a pagination pipeline, where a stray character would corrupt the data.
+API_FAIL_SEEN_FILE="$HTTP_STATE_DIR/warned_contexts"
+API_FAIL_TALLY_FILE="$HTTP_STATE_DIR/failed_contexts"
+: > "$API_FAIL_SEEN_FILE"
+: > "$API_FAIL_TALLY_FILE"
+
+warn_api_failure() {
+    local context="$1"
+    local status why key
+    status=$(http_last_status)
+    why=$(http_status_hint "$status")
+
+    printf '%s\t%s\n' "$context" "$why" >> "$API_FAIL_TALLY_FILE" 2>/dev/null
+
+    key="$context|$status"
+    grep -qxF "$key" "$API_FAIL_SEEN_FILE" 2>/dev/null && return 0
+    echo "$key" >> "$API_FAIL_SEEN_FILE" 2>/dev/null
+
+    report_warn "$context could not be read - $why. Any related figure below reads as ZERO; confirm it is genuinely zero before sizing from it."
+}
+
 # -------- PAGINATION HELPERS --------
 # Azure DevOps caps most list endpoints at 100-1000 items per response. Without
 # following the continuation token the collector silently returns a truncated
@@ -948,7 +984,7 @@ for project in "${projects[@]}"; do
     # Store repo details for later analysis, including project visibility
     # Use jq --arg to safely pass project name and visibility (handles quotes and backslashes)
     jq -c --arg proj "$project" --arg vis "$project_visibility" \
-        '{project: $proj, projectVisibility: $vis, name: .name, id: .id, size: .size, defaultBranch: .defaultBranch, remoteUrl: .remoteUrl}' \
+        '{project: $proj, projectVisibility: $vis, name: .name, id: .id, size: .size, defaultBranch: .defaultBranch, remoteUrl: .remoteUrl, isDisabled: (.isDisabled // false)}' \
         "$project_repos_ndjson" >> "$REPO_DETAILS_FILE.tmp" 2>/dev/null
 done
 
@@ -965,6 +1001,21 @@ fi
 
 echo "Total Projects: $project_count" | tee -a "$REPORT_FILE"
 echo "Total Repositories: $total_repos" | tee -a "$REPORT_FILE"
+
+# A disabled repository still appears in the repository list but serves no
+# content: commits, pull requests and security alerts all return 404. Counting
+# it alongside active repositories overstates the migration surface, and the
+# 404s it causes would otherwise be folded into other sections as genuine zeros.
+disabled_repos=$(num "$(jq '[.[] | select(.isDisabled == true)] | length' "$REPO_DETAILS_FILE" 2>/dev/null)")
+active_repos=$((total_repos - disabled_repos))
+if [ "$disabled_repos" -gt 0 ]; then
+    echo "  Active:   $active_repos" | tee -a "$REPORT_FILE"
+    echo "  DISABLED: $disabled_repos (present in Azure DevOps but serving no content)" | tee -a "$REPORT_FILE"
+    echo "" | tee -a "$REPORT_FILE"
+    echo "  Disabled repositories are excluded from the commit-history, pull-request" | tee -a "$REPORT_FILE"
+    echo "  and security-alert figures below, because Azure DevOps returns no data" | tee -a "$REPORT_FILE"
+    echo "  for them. Confirm whether they are in scope before sizing a migration." | tee -a "$REPORT_FILE"
+fi
 
 # ========================================
 # 2. PUBLIC REPOSITORIES
@@ -1073,7 +1124,7 @@ if [ -f "$REPO_DETAILS_FILE" ]; then
         
         # Validate JSON before processing
         if [ "$commit_data" = "API_ERROR" ] || ! echo "$commit_data" | jq empty 2>/dev/null; then
-            echo "  WARNING: Invalid API response for $project/$repo_name (skipping)" | tee -a "$REPORT_FILE"
+            warn_api_failure "Repository commit history"
             continue
         fi
         
@@ -1092,7 +1143,7 @@ if [ -f "$REPO_DETAILS_FILE" ]; then
         else
             echo "  No commits found in $project/$repo_name" | tee -a "$REPORT_FILE"
         fi
-    done < <(jq -c '.[]' "$REPO_DETAILS_FILE")
+    done < <(jq -c '.[] | select(.isDisabled != true)' "$REPO_DETAILS_FILE")
     
     if [ -f "$TEMP_DATA_DIR/oldest_commits.txt" ] && [ -s "$TEMP_DATA_DIR/oldest_commits.txt" ]; then
         # Sort by first field (date) explicitly using tab as separator
@@ -1300,7 +1351,7 @@ for project in "${projects[@]}"; do
         project_repos=()
         while IFS= read -r repo_id; do
             [ -n "$repo_id" ] && project_repos+=("$repo_id")
-        done < <(jq -r --arg proj "$project" '.[] | select(.project == $proj) | .id' "$REPO_DETAILS_FILE")
+        done < <(jq -r --arg proj "$project" '.[] | select(.project == $proj) | select(.isDisabled != true) | .id' "$REPO_DETAILS_FILE")
         
         # Only loop if we actually have repo IDs (skip empty array)
         if [ ${#project_repos[@]} -gt 0 ] && [ -n "${project_repos[0]}" ]; then
@@ -1317,6 +1368,9 @@ for project in "${projects[@]}"; do
     
     # Check for boards (teams indicate board usage)
     teams_response=$(call_api "$ORG_URL/_apis/projects/$project_encoded/teams?api-version=$API_VERSION")
+    if [ "$teams_response" = "API_ERROR" ]; then
+        warn_api_failure "Project teams (board usage)"
+    fi
     teams=$(safe_jq_count "$teams_response" '.count')
     if [ "$teams" -gt 0 ]; then
         projects_with_boards=$((projects_with_boards + 1))
@@ -1477,12 +1531,33 @@ total_dependency_alerts=0
 total_code_alerts=0
 repos_with_alerts=0
 
-# Check if Advanced Security is enabled by testing the API
+# Determine whether Advanced Security is available AND actually onboarded
 # Note: Using call_api with Bearer token (same auth as all other APIs)
 advsec_test=$(call_api "https://advsec.dev.azure.com/$ORG/_apis/management/enablement?api-version=7.2-preview.1")
 
+# A readable enablement endpoint only proves Advanced Security is AVAILABLE to
+# the organization; it says nothing about whether any repository is onboarded.
+# Treating a 200 here as "enabled" previously led the report to print confident
+# zero-alert totals that were really the product of a 404 on every repository.
+# The payload carries per-repository state, so use it.
+advsec_readable=0
+advsec_repos_total=0
+advsec_repos_enabled=0
+ADVSEC_ENABLED_REPOS_FILE="$TEMP_DATA_DIR/advsec_enabled_repos.txt"
+: > "$ADVSEC_ENABLED_REPOS_FILE"
+
 if [ "$advsec_test" != "API_ERROR" ] && echo "$advsec_test" | jq empty 2>/dev/null; then
-    echo "Advanced Security is enabled for this organization" | tee -a "$REPORT_FILE"
+    advsec_readable=1
+    advsec_repos_total=$(num "$(echo "$advsec_test" \
+        | jq '[.reposEnablementStatus[]?] | length' 2>/dev/null)")
+    echo "$advsec_test" \
+        | jq -r '.reposEnablementStatus[]? | select(.advSecEnabled == true) | .repositoryId // empty' \
+        2>/dev/null > "$ADVSEC_ENABLED_REPOS_FILE"
+    advsec_repos_enabled=$(num "$(grep -c . "$ADVSEC_ENABLED_REPOS_FILE" 2>/dev/null)")
+fi
+
+if [ "$advsec_readable" = "1" ] && [ "$advsec_repos_enabled" -gt 0 ]; then
+    echo "Advanced Security is enabled on $advsec_repos_enabled of $advsec_repos_total repositories" | tee -a "$REPORT_FILE"
     echo "" | tee -a "$REPORT_FILE"
     
     # Initialize secret scanning detail files only when explicitly requested.
@@ -1519,6 +1594,11 @@ if [ "$advsec_test" != "API_ERROR" ] && echo "$advsec_test" | jq empty 2>/dev/nu
                 repo_id=$(echo "$repo_line" | jq -r '.id')
                 
                 [ -z "$repo_id" ] || [ "$repo_id" = "null" ] && continue
+                
+                # Only repositories with Advanced Security switched on expose the
+                # alert endpoints. The rest return 404, which the caller below
+                # would otherwise fold into the totals as a genuine zero.
+                grep -qxF "$repo_id" "$ADVSEC_ENABLED_REPOS_FILE" 2>/dev/null || continue
                 
                 echo "    Checking repo: $repo_name ($repo_id)" | tee -a "$REPORT_FILE"
                 
@@ -1758,8 +1838,13 @@ if [ "$advsec_test" != "API_ERROR" ] && echo "$advsec_test" | jq empty 2>/dev/nu
             echo "  file paths and line numbers for the remediation team." | tee -a "$REPORT_FILE"
         fi
     fi
-else
-    echo "Advanced Security is NOT enabled for this organization" | tee -a "$REPORT_FILE"
+elif [ "$advsec_readable" = "1" ]; then
+    echo "Advanced Security is NOT enabled on any repository in this organization" | tee -a "$REPORT_FILE"
+    echo "  Repositories reported by the enablement API: $advsec_repos_total" | tee -a "$REPORT_FILE"
+    echo "  Repositories with Advanced Security switched on: 0" | tee -a "$REPORT_FILE"
+    echo "" | tee -a "$REPORT_FILE"
+    echo "There are therefore no alerts to count. This is an onboarding and licensing" | tee -a "$REPORT_FILE"
+    echo "state, not a collection failure." | tee -a "$REPORT_FILE"
     echo "" | tee -a "$REPORT_FILE"
     echo "NOTE: Azure DevOps Advanced Security is a paid add-on feature that includes:" | tee -a "$REPORT_FILE"
     echo "  - Secret scanning (credentials, tokens, keys)" | tee -a "$REPORT_FILE"
@@ -1769,6 +1854,16 @@ else
     echo "If scanning coverage is a requirement, it is currently being met by" | tee -a "$REPORT_FILE"
     echo "third-party tooling in the pipelines, or not at all. Section 10 lists" | tee -a "$REPORT_FILE"
     echo "the security extensions actually in use." | tee -a "$REPORT_FILE"
+else
+    # The enablement endpoint itself could not be read, so scanning coverage is
+    # genuinely unknown. Saying "not enabled" here would state as fact something
+    # the collector never established.
+    warn_api_failure "Advanced Security enablement status"
+    echo "Advanced Security status could NOT be read for this organization" | tee -a "$REPORT_FILE"
+    echo "" | tee -a "$REPORT_FILE"
+    echo "This is a FAILED READ, not a confirmed absence. The alert totals above" | tee -a "$REPORT_FILE"
+    echo "are zero because nothing could be collected - treat scanning coverage as" | tee -a "$REPORT_FILE"
+    echo "UNKNOWN and confirm it separately before drawing any conclusion." | tee -a "$REPORT_FILE"
 fi
 
 # ========================================
@@ -1780,27 +1875,39 @@ maybe_refresh_token
 echo "Checking for service hooks, extensions and service connections..." | tee -a "$REPORT_FILE"
 
 total_hooks=0
-rm -f "$TEMP_DATA_DIR/hook_types.txt" "$TEMP_DATA_DIR/service_connections.ndjson"
+hooks_enabled=0
+rm -f "$TEMP_DATA_DIR/hook_types.txt" "$TEMP_DATA_DIR/hook_events.txt" "$TEMP_DATA_DIR/service_connections.ndjson"
 
 SERVICE_CONN_FILE="$TEMP_DATA_DIR/service_connections.json"
 EXTENSIONS_FILE="$TEMP_DATA_DIR/extensions.json"
+
+# Service hooks are ORGANIZATION-scoped. Requesting them per project returns 404
+# on every project, so the previous per-project call produced a confident
+# "Total Service Hooks: 0" on organizations that in fact had hundreds - and
+# integrations are one of the strongest drivers of migration effort.
+hooks=$(call_api "$ORG_URL/_apis/hooks/subscriptions?api-version=$API_VERSION")
+if [ "$hooks" != "API_ERROR" ] && echo "$hooks" | jq empty 2>/dev/null; then
+    total_hooks=$(safe_jq_count "$hooks" '.count')
+    # consumerId is the delivery target (webHooks, slack, teams, jenkins...) and
+    # eventType is the trigger. Together they describe the integration surface
+    # that has to be rebuilt. Note it is consumerId, NOT consumerType: this
+    # endpoint does not return consumerType, so asking for it silently yielded
+    # an empty breakdown under an otherwise correct total.
+    echo "$hooks" | jq -r '.value[]?.consumerId // empty' 2>/dev/null \
+        > "$TEMP_DATA_DIR/hook_types.txt"
+    echo "$hooks" | jq -r '.value[]?.eventType // empty' 2>/dev/null \
+        > "$TEMP_DATA_DIR/hook_events.txt"
+    hooks_enabled=$(num "$(echo "$hooks" \
+        | jq '[.value[]? | select(.status == "enabled")] | length' 2>/dev/null)")
+else
+    warn_api_failure "Service hooks (organization-scoped)"
+fi
 
 for project in "${projects[@]}"; do
     [ -z "$project" ] && continue
     [ "$DEBUG" = "1" ] && echo "  Checking integrations for project: $project" | tee -a "$REPORT_FILE"
 
     project_encoded=$(url_encode "$project")
-
-    # Service hooks
-    hooks=$(call_api "$ORG_URL/$project_encoded/_apis/hooks/subscriptions?api-version=$API_VERSION")
-    hook_count=$(safe_jq_count "$hooks" '.count')
-
-    if [ "$hook_count" -gt 0 ]; then
-        total_hooks=$((total_hooks + hook_count))
-        if [ "$hooks" != "API_ERROR" ] && echo "$hooks" | jq empty 2>/dev/null; then
-            echo "$hooks" | jq -r '.value[].consumerType' 2>/dev/null >> "$TEMP_DATA_DIR/hook_types.txt"
-        fi
-    fi
 
     # Service connections are the strongest signal of third-party coupling.
     # The connection *type* (salesforce, sonarqube, artifactory, kubernetes...)
@@ -1836,14 +1943,27 @@ distinct_connection_types=$(jq '[.[].type] | unique | length' "$SERVICE_CONN_FIL
 total_extensions=$(jq 'length' "$EXTENSIONS_FILE")
 
 echo "" | tee -a "$REPORT_FILE"
-echo "Total Service Hooks: $total_hooks" | tee -a "$REPORT_FILE"
+echo "Total Service Hooks: $total_hooks ($hooks_enabled enabled)" | tee -a "$REPORT_FILE"
 
-if [ -f "$TEMP_DATA_DIR/hook_types.txt" ]; then
+if [ -s "$TEMP_DATA_DIR/hook_types.txt" ]; then
     echo "" | tee -a "$REPORT_FILE"
-    echo "Service Hook Consumer Types:" | tee -a "$REPORT_FILE"
+    echo "Service Hook Consumer Types (where each hook delivers):" | tee -a "$REPORT_FILE"
     sort "$TEMP_DATA_DIR/hook_types.txt" | uniq -c | sort -rn | while read -r count hook; do
         echo "  - $hook: $count" | tee -a "$REPORT_FILE"
     done
+fi
+
+# The trigger mix shows which parts of the estate are wired into external
+# systems - a repo-event hook and a pipeline-event hook are different pieces
+# of migration work.
+if [ -s "$TEMP_DATA_DIR/hook_events.txt" ]; then
+    hook_event_types=$(sort -u "$TEMP_DATA_DIR/hook_events.txt" | grep -c .)
+    echo "" | tee -a "$REPORT_FILE"
+    echo "Service Hook Event Types: $hook_event_types distinct (top 15 by count)" | tee -a "$REPORT_FILE"
+    sort "$TEMP_DATA_DIR/hook_events.txt" | uniq -c | sort -rn | head -15 \
+        | while read -r count evt; do
+            echo "  - $evt: $count" | tee -a "$REPORT_FILE"
+        done
 fi
 
 echo "" | tee -a "$REPORT_FILE"
@@ -2944,7 +3064,10 @@ while IFS= read -r pool_line; do
     [ -z "$jr_pool_id" ] && continue
 
     jr_body=$(call_api "$ORG_URL/_apis/distributedtask/pools/$jr_pool_id/jobrequests?api-version=7.1-preview.1")
-    [ "$jr_body" = "API_ERROR" ] && continue
+    if [ "$jr_body" = "API_ERROR" ]; then
+        warn_api_failure "Agent pool job requests"
+        continue
+    fi
     echo "$jr_body" | jq empty 2>/dev/null || continue
 
     echo "$jr_body" | jq -c --arg pool "$jr_pool_name" --argjson hosted "$jr_pool_hosted" '
@@ -3267,7 +3390,10 @@ if [ "$total_environments" -gt 0 ]; then
 
         c_project_enc=$(url_encode "$c_project")
         checks_body=$(call_api "$ORG_URL/$c_project_enc/_apis/pipelines/checks/configurations?resourceType=environment&resourceId=$c_envid&api-version=7.1-preview.1")
-        [ "$checks_body" = "API_ERROR" ] && continue
+        if [ "$checks_body" = "API_ERROR" ]; then
+            warn_api_failure "Environment approvals and checks"
+            continue
+        fi
         echo "$checks_body" | jq empty 2>/dev/null || continue
         echo "$checks_body" | jq -c --arg proj "$c_project" '
             .value[]? | {project: $proj, type: (.type.name // "Unknown")}' \
@@ -3426,7 +3552,10 @@ touch "$TEMP_DATA_DIR/resource_usage.ndjson"
 while IFS=' ' read -r ru_tag ru_hosted; do
     [ -z "$ru_tag" ] && continue
     ru_body=$(call_api "$ORG_URL/_apis/distributedtask/resourceusage?parallelismTag=$ru_tag&poolIsHosted=$ru_hosted&includeRunningRequests=false&api-version=7.1-preview.1")
-    [ "$ru_body" = "API_ERROR" ] && continue
+    if [ "$ru_body" = "API_ERROR" ]; then
+        warn_api_failure "Parallel job resource usage ($ru_tag)"
+        continue
+    fi
     echo "$ru_body" | jq empty 2>/dev/null || continue
     echo "$ru_body" | jq -c --arg tag "$ru_tag" --argjson hosted "$ru_hosted" '{
         parallelismTag: $tag,
@@ -3458,7 +3587,7 @@ else
         "$RESOURCE_USAGE_FILE" | tee -a "$REPORT_FILE"
 fi
 
-ent_body=$(call_api "https://vsaex.dev.azure.com/$ORG/_apis/userentitlementsummary?select=licenses&api-version=7.1-preview.2")
+ent_body=$(call_api "https://vsaex.dev.azure.com/$ORG/_apis/userentitlementsummary?select=licenses&api-version=5.0-preview.1")
 if [ "$ent_body" != "API_ERROR" ] && echo "$ent_body" | jq empty 2>/dev/null; then
     echo "$ent_body" > "$ENTITLEMENT_FILE"
     echo "" | tee -a "$REPORT_FILE"
@@ -3469,6 +3598,7 @@ if [ "$ent_body" != "API_ERROR" ] && echo "$ent_body" | jq empty 2>/dev/null; th
           else ($l[] | "  - \(.licenseName // .accountLicenseType // .license // "unknown"): assigned \(.assigned // 0) of \(.total // 0)")
           end' "$ENTITLEMENT_FILE" 2>/dev/null | tee -a "$REPORT_FILE"
 else
+    warn_api_failure "Licence entitlement summary"
     echo "" | tee -a "$REPORT_FILE"
     echo "Licence Entitlements: not available to this account." | tee -a "$REPORT_FILE"
     echo "  Section 11 still provides per-user access levels as a substitute." | tee -a "$REPORT_FILE"
@@ -3750,6 +3880,8 @@ jq -n \
   --arg historyStart "${HISTORY_START:-}" \
   --argjson projects "${project_count:-0}" \
   --argjson repos "${total_repos:-0}" \
+  --argjson activeRepos "${active_repos:-0}" \
+  --argjson disabledRepos "${disabled_repos:-0}" \
   --argjson largeRepos "${large_repos:-0}" \
   --argjson largeFiles "${total_large_files:-0}" \
   --argjson workItems "${total_work_items:-0}" \
@@ -3862,11 +3994,13 @@ jq -n \
       warnings: ($warnList[0] // []),
       throttledRequests: $throttled,
       failedRequestsByStatus: ($httpErrors[0] // []),
-      schemaVersion: "1.2"
+      schemaVersion: "1.3"
     },
     content: {
       projects: $projects,
       repositories: $repos,
+      repositoriesActive: $activeRepos,
+      repositoriesDisabled: $disabledRepos,
       repositoriesOver1Gb: $largeRepos,
       filesOver50Mb: $largeFiles,
       workItems: $workItems,
@@ -4054,6 +4188,22 @@ if [ "$http_fail_total" -gt 0 ]; then
     sort "$HTTP_STATUS_LOG" 2>/dev/null | uniq -c | sort -rn | while read -r c code; do
         echo "  $c x $(http_status_hint "$code")" | tee -a "$REPORT_FILE"
     done
+
+    # Status codes alone do not say WHICH figure is affected. This maps the
+    # failures back to the sections that degraded to zero because of them, so a
+    # reader can tell a harmless probe from a hole in the numbers they are
+    # about to size from.
+    if [ -s "$API_FAIL_TALLY_FILE" ]; then
+        echo "" | tee -a "$REPORT_FILE"
+        echo "Affected figures:" | tee -a "$REPORT_FILE"
+        sort "$API_FAIL_TALLY_FILE" 2>/dev/null | uniq -c | sort -rn \
+            | while IFS= read -r line; do
+                fc=$(echo "$line" | awk '{print $1}')
+                fctx=$(echo "$line" | sed 's/^ *[0-9]* *//' | cut -f1)
+                fwhy=$(echo "$line" | cut -f2-)
+                echo "  $fctx - $fc failed request(s) - $fwhy" | tee -a "$REPORT_FILE"
+            done
+    fi
     if [ "$throttle_total" -gt 0 ]; then
         echo "" | tee -a "$REPORT_FILE"
         echo "  Azure DevOps rate-limited $throttle_total request(s). The collector" | tee -a "$REPORT_FILE"

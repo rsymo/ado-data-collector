@@ -104,11 +104,11 @@ The generated `ado-data-report-RUN.txt` contains these sections:
 
 | Sections | What to look for |
 |---|---|
-| 1–6: Repositories | Project and repository totals, public repositories, repositories over 1 GB, the largest and oldest repositories, and optional files over 50 MB |
+| 1–6: Repositories | Project and repository totals split into active and disabled, public repositories, repositories over 1 GB, the largest and oldest repositories, and optional files over 50 MB |
 | 7: Work items and PRs | Work items, pull requests, and projects with boards or teams |
 | 8: Pipelines | YAML versus Classic, disabled pipelines, non-Azure-Repos sources, Classic release pipelines, task groups, variable groups, Key Vault-backed groups, and pipeline counts by project |
-| 9: Security | Advanced Security status and secret, dependency, and code-scanning alerts |
-| 10: Integrations | Service hooks, service connections, and installed Marketplace extensions |
+| 9: Security | Whether Advanced Security is available and how many repositories have it switched on, plus secret, dependency, and code-scanning alerts |
+| 10: Integrations | Service hooks by consumer and event type, service connections, and installed Marketplace extensions |
 | 11: Users | Total users, access levels, license source, sign-in recency, stakeholders, likely service accounts, and unique committers |
 | 12: Build activity | Builds and compute minutes, duration and queue-time percentiles, outcomes, pool usage, concurrency, and dormant pipelines |
 | 13: Agents | Microsoft-hosted and self-hosted pools, registered/online/enabled agents, operating systems, and per-pool details |
