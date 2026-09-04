@@ -3,8 +3,16 @@
 # ========================================
 # Azure DevOps Data Collector
 # ========================================
-# This script collects data from Azure DevOps organizations
-# for GitHub migration planning.
+# This script builds a read-only inventory of an Azure DevOps organization:
+# what exists, what is actually being used, and what the platform team
+# operates. It is useful for estate review, cleanup and consolidation work on
+# its own.
+#
+# Because the most common reason to inventory an estate is to evaluate a move,
+# later sections additionally express pipeline usage in units that can be
+# compared against other CI providers - notably job-level minutes and the
+# operating-system mix, which is how GitHub Actions bills. Nothing is priced;
+# the collector reports quantities only.
 #
 # READ-ONLY GUARANTEE
 #   This collector never writes to Azure DevOps. It only reads.
@@ -55,6 +63,10 @@ TIMELINE_SAMPLE_MAX=${TIMELINE_SAMPLE_MAX:-1500}
 # runner ratios published at the time of writing. Rates change and vary by
 # plan and runner size, so confirm them against current pricing and override
 # here if they differ.
+# Per-user detail (display names and email addresses) is personal data and is
+# never needed to size an estate. Set EXPORT_USER_DETAILS=1 to additionally
+# write the per-user CSV for internal use; by default only counts are produced.
+EXPORT_USER_DETAILS=${EXPORT_USER_DETAILS:-0}
 MULT_LINUX=${MULT_LINUX:-1}
 MULT_WINDOWS=${MULT_WINDOWS:-2}
 MULT_MACOS=${MULT_MACOS:-10}
@@ -1744,19 +1756,32 @@ if [ "$user_count" -gt 0 ]; then
     echo "  becomes a paid GitHub Enterprise seat. This is the most common" | tee -a "$REPORT_FILE"
     echo "  source of budget surprise in ADO-to-GitHub licensing models." | tee -a "$REPORT_FILE"
 
-    # Export user list to CSV in the working directory so it survives the
-    # temp-directory cleanup trap.
-    echo "displayName,emailAddress,accessLevel,licensingSource,lastAccessDate,dateCreated" > "$USER_CSV"
-    jq -r '.[] | [
-            (.user.displayName // ""),
-            (.user.mailAddress // ""),
-            (.accessLevel.accountLicenseType // ""),
-            (.accessLevel.licensingSource // ""),
-            (.lastAccessedDate // ""),
-            (.dateCreated // "")
-          ] | @csv' "$USERS_FILE" >> "$USER_CSV" 2>/dev/null
-    echo "" | tee -a "$REPORT_FILE"
-    echo "User details exported to: $USER_CSV" | tee -a "$REPORT_FILE"
+    # Per-user detail is personal data (names and email addresses) and is not
+    # needed for estate sizing or cost modelling - the counts above already
+    # cover that. It is therefore opt-in, so the default output of this script
+    # can be shared without disclosing who works at the organization.
+    if [ "$EXPORT_USER_DETAILS" = "1" ]; then
+        # Written to the working directory so it survives the temp-directory
+        # cleanup trap.
+        echo "displayName,emailAddress,accessLevel,licensingSource,lastAccessDate,dateCreated" > "$USER_CSV"
+        jq -r '.[] | [
+                (.user.displayName // ""),
+                (.user.mailAddress // ""),
+                (.accessLevel.accountLicenseType // ""),
+                (.accessLevel.licensingSource // ""),
+                (.lastAccessedDate // ""),
+                (.dateCreated // "")
+              ] | @csv' "$USERS_FILE" >> "$USER_CSV" 2>/dev/null
+        echo "" | tee -a "$REPORT_FILE"
+        echo "User details exported to: $USER_CSV" | tee -a "$REPORT_FILE"
+        echo "  This file contains PERSONAL DATA (names and email addresses)." | tee -a "$REPORT_FILE"
+        echo "  Keep it internal. It is not required for estate sizing." | tee -a "$REPORT_FILE"
+    else
+        echo "" | tee -a "$REPORT_FILE"
+        echo "  Per-user detail (names, email addresses) was NOT exported." | tee -a "$REPORT_FILE"
+        echo "  The counts above are all that estate sizing requires. Set" | tee -a "$REPORT_FILE"
+        echo "  EXPORT_USER_DETAILS=1 to write the per-user CSV for internal use." | tee -a "$REPORT_FILE"
+    fi
 else
     echo "WARNING: No user entitlement data retrieved." | tee -a "$REPORT_FILE"
     echo "  This usually means the account lacks Member Entitlement Management" | tee -a "$REPORT_FILE"
@@ -2338,7 +2363,7 @@ echo "Use these denominators to compare in-house, partner, and managed" | tee -a
 echo "service options on the same basis." | tee -a "$REPORT_FILE"
 
 # ========================================
-# TCO COLLECTION DEFAULTS
+# SECTION 16-22 COLLECTION DEFAULTS
 # ========================================
 # Every figure produced by sections 16-22 is initialised here so that a skipped
 # or permission-denied section still leaves the summary and the JSON export with
@@ -2960,7 +2985,7 @@ maybe_refresh_token
 
 # None of these migrate automatically. Each approval, gate, secret and secure
 # file is manual re-implementation effort in Actions, so the counts are a direct
-# input to the migration side of the TCO rather than the run-rate side.
+# input to the one-off migration effort rather than the ongoing run-rate.
 
 ENVIRONMENTS_FILE="$TEMP_DATA_DIR/environments.json"
 CHECKS_FILE="$TEMP_DATA_DIR/checks.json"
@@ -3400,13 +3425,11 @@ echo "----------------------------------------------------------------" | tee -a
 echo "This report was produced by read-only API calls. Nothing was created," | tee -a "$REPORT_FILE"
 echo "changed or deleted in Azure DevOps." | tee -a "$REPORT_FILE"
 echo "" | tee -a "$REPORT_FILE"
-echo "This text report CONTAINS:" | tee -a "$REPORT_FILE"
+echo "This report CONTAINS:" | tee -a "$REPORT_FILE"
 echo "  - counts, durations, dates and aggregate statistics" | tee -a "$REPORT_FILE"
 echo "  - names of projects, repositories, pipelines, agent pools," | tee -a "$REPORT_FILE"
 echo "    environments, variable groups and service connections" | tee -a "$REPORT_FILE"
 echo "  - names of installed extensions and the tasks pipelines execute" | tee -a "$REPORT_FILE"
-echo "  - display names of the people who created variable groups and" | tee -a "$REPORT_FILE"
-echo "    service connections" | tee -a "$REPORT_FILE"
 if [ "$SCAN_LARGE_FILES" = "1" ]; then
     echo "  - paths of large files found in repositories (SCAN_LARGE_FILES=1)" | tee -a "$REPORT_FILE"
 fi
@@ -3416,15 +3439,27 @@ echo "  - any secret, password, token, certificate or variable VALUE" | tee -a "
 echo "  - source code or file contents" | tee -a "$REPORT_FILE"
 echo "  - work item titles, descriptions or comments (only a count is read)" | tee -a "$REPORT_FILE"
 echo "  - build logs, test output or commit messages" | tee -a "$REPORT_FILE"
+echo "  - names or email addresses of individual people" | tee -a "$REPORT_FILE"
 echo "" | tee -a "$REPORT_FILE"
-echo "PERSONAL DATA - read this before sending anything externally:" | tee -a "$REPORT_FILE"
-echo "  The users CSV written alongside this report lists every user by" | tee -a "$REPORT_FILE"
-echo "  DISPLAY NAME and EMAIL ADDRESS. That file is for your own internal" | tee -a "$REPORT_FILE"
-echo "  review. A cost or migration assessment needs only the user COUNTS," | tee -a "$REPORT_FILE"
-echo "  which are already in this text report and in the JSON file, so do" | tee -a "$REPORT_FILE"
-echo "  not send the users CSV unless you have a specific reason to." | tee -a "$REPORT_FILE"
+echo "People appear only as COUNTS (licence totals, active users, distinct" | tee -a "$REPORT_FILE"
+echo "pipeline authors). No individual is identified." | tee -a "$REPORT_FILE"
+if [ "$EXPORT_USER_DETAILS" = "1" ]; then
+    echo "" | tee -a "$REPORT_FILE"
+    echo "EXCEPTION - you ran with EXPORT_USER_DETAILS=1:" | tee -a "$REPORT_FILE"
+    echo "  A separate users CSV was written containing DISPLAY NAMES and" | tee -a "$REPORT_FILE"
+    echo "  EMAIL ADDRESSES. That file is personal data. It is not part of" | tee -a "$REPORT_FILE"
+    echo "  this report and is not needed for estate sizing - keep it" | tee -a "$REPORT_FILE"
+    echo "  internal and do not include it when sharing these findings." | tee -a "$REPORT_FILE"
+fi
+if [ "$(num "${total_secret_alerts:-0}")" -gt 0 ]; then
+    echo "" | tee -a "$REPORT_FILE"
+    echo "Note: secret scanning findings were written to separate files. Those" | tee -a "$REPORT_FILE"
+    echo "  identify FILE PATHS AND LINE NUMBERS where credentials were detected" | tee -a "$REPORT_FILE"
+    echo "  (never the values). Treat them as security-sensitive and share them" | tee -a "$REPORT_FILE"
+    echo "  only with the team remediating those alerts." | tee -a "$REPORT_FILE"
+fi
 echo "" | tee -a "$REPORT_FILE"
-echo "Project and pipeline names can also be commercially sensitive. Review" | tee -a "$REPORT_FILE"
+echo "Project and pipeline names can still be commercially sensitive. Review" | tee -a "$REPORT_FILE"
 echo "this report before sending it outside your organization and redact any" | tee -a "$REPORT_FILE"
 echo "names you would rather not disclose - the counts and minutes stay" | tee -a "$REPORT_FILE"
 echo "usable without them." | tee -a "$REPORT_FILE"
@@ -3799,7 +3834,8 @@ echo "========================================" | tee -a "$REPORT_FILE"
 echo "Report generation complete!" | tee -a "$REPORT_FILE"
 echo "Report saved to: $REPORT_FILE" | tee -a "$REPORT_FILE"
 [ -s "$SIZING_JSON" ] && echo "Structured sizing data saved to: $SIZING_JSON" | tee -a "$REPORT_FILE"
-[ -s "$USER_CSV" ] && echo "User export saved to: $USER_CSV" | tee -a "$REPORT_FILE"
+[ "$EXPORT_USER_DETAILS" = "1" ] && [ -s "$USER_CSV" ] && \
+    echo "User export saved to: $USER_CSV (contains personal data - keep internal)" | tee -a "$REPORT_FILE"
 if [ "$total_secret_alerts" -gt 0 ] && [ -f "$SECRET_SCANNING_REPORT" ]; then
     echo "Secret scanning details saved to: $SECRET_SCANNING_REPORT" | tee -a "$REPORT_FILE"
     echo "Secret scanning CSV saved to: $SECRET_SCANNING_CSV" | tee -a "$REPORT_FILE"
