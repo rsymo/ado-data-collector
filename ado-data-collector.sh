@@ -2643,7 +2643,8 @@ else
            | map({buildId: .[0].buildId,
                   tasks: length,
                   distinctTasks: ([.[].taskId] | unique | length),
-                  extTasks: ([.[] | select((.taskId as $t | $extIds | index($t)) != null)] | length)})
+                  extTasks: ([.[] | select((.taskId as $t | $extIds | index($t)) != null) | .taskId]
+                             | unique | length)})
            | map({key: (.buildId | tostring), value: .}) | from_entries) as $tmap
         | $jb | map(. + (($tmap[(.buildId | tostring)] // {})
                          | {tasks: (.tasks // 0),
@@ -3132,7 +3133,7 @@ else
         echo "Most complex pipelines observed (top 15):" | tee -a "$REPORT_FILE"
         jq -r '[.[] | select(.complexity == "complex")]
                | sort_by(-(.extTasks * 100 + .distinctTasks + .jobs)) | .[:15][]
-               | "  - \(.project) / \(.name): \(.jobs) jobs, \(.distinctTasks) tasks, \(.extTasks) extension tasks"' \
+               | "  - \(.project) / \(.name): \(.jobs) jobs, \(.distinctTasks) distinct tasks, \(.extTasks) extension tasks"' \
             "$COMPLEXITY_FILE" | tee -a "$REPORT_FILE"
     fi
 
