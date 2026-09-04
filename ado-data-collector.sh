@@ -50,6 +50,14 @@ SKIP_TIMELINE=${SKIP_TIMELINE:-0}
 # then extrapolates. Raising it improves precision at the cost of one extra API
 # call per additional build.
 TIMELINE_SAMPLE_MAX=${TIMELINE_SAMPLE_MAX:-1500}
+# Cost multipliers used to convert the observed operating-system mix into a
+# single Linux-equivalent figure. These default to the GitHub-hosted standard
+# runner ratios published at the time of writing. Rates change and vary by
+# plan and runner size, so confirm them against current pricing and override
+# here if they differ.
+MULT_LINUX=${MULT_LINUX:-1}
+MULT_WINDOWS=${MULT_WINDOWS:-2}
+MULT_MACOS=${MULT_MACOS:-10}
 # Seconds before the Azure AD token is proactively refreshed. Defaulted here
 # (not just at the refresh helper) so it can be validated with the other
 # numeric settings below.
@@ -93,6 +101,26 @@ for _cfg in HISTORY_DAYS MAX_BUILDS_PER_PROJECT TOKEN_MAX_AGE TIMELINE_SAMPLE_MA
         echo "ERROR: $_cfg must be at least 1 (got: '$_val')" >&2
         exit 1
     fi
+done
+unset _cfg _val
+
+# Cost multipliers are validated separately: they may legitimately be decimals
+# (a plan or runner size whose ratio is not a whole number), but a zero or
+# negative value would silently collapse the Linux-equivalent figure to nothing.
+for _cfg in MULT_LINUX MULT_WINDOWS MULT_MACOS; do
+    eval "_val=\${$_cfg}"
+    case "$_val" in
+        ''|*[!0-9.]*|*.*.*|.|*.)
+            echo "ERROR: $_cfg must be a positive number (got: '$_val')" >&2
+            exit 1
+            ;;
+    esac
+    case "$_val" in
+        0|0.|0.0|0.00|.0|.00)
+            echo "ERROR: $_cfg must be greater than zero (got: '$_val')" >&2
+            exit 1
+            ;;
+    esac
 done
 unset _cfg _val
 
@@ -1990,7 +2018,7 @@ else
         echo "  not the unit GitHub Actions bills on. Actions bills per JOB and" | tee -a "$REPORT_FILE"
         echo "  rounds each job up to the next whole minute, so a build running" | tee -a "$REPORT_FILE"
         echo "  four jobs in parallel bills roughly four times its wall-clock." | tee -a "$REPORT_FILE"
-        echo "  Multipliers then apply (Windows 2x, macOS 10x against Linux)." | tee -a "$REPORT_FILE"
+        echo "  Multipliers then apply (Windows ${MULT_WINDOWS}x, macOS ${MULT_MACOS}x against Linux)." | tee -a "$REPORT_FILE"
         echo "  Section 16 measures the job-level figure; section 17 measures the" | tee -a "$REPORT_FILE"
         echo "  operating-system mix that drives the multiplier. Use those two" | tee -a "$REPORT_FILE"
         echo "  sections for cost modelling, not the wall-clock total above." | tee -a "$REPORT_FILE"
@@ -2077,8 +2105,8 @@ if [ "$total_agents" -gt 0 ]; then
         "$AGENTS_FILE" | tee -a "$REPORT_FILE"
 
     # Agent size is what an equivalent GitHub-hosted or ARC runner has to match,
-    # and is the multiplier on any self-hosted infrastructure cost the customer
-    # supplies. Reported from agent-declared capabilities, which are only
+    # and is the multiplier on the self-hosted infrastructure cost you supply
+    # from your own cloud or datacentre billing. Reported from agent-declared capabilities, which are only
     # present for agents that have connected at least once.
     agents_with_cpu=$(jq '[.[] | select(.cpuCount != null)] | length' "$AGENTS_FILE")
     if [ "$agents_with_cpu" -gt 0 ]; then
@@ -2091,14 +2119,14 @@ if [ "$total_agents" -gt 0 ]; then
                | group_by(.) | map({cpu: .[0], count: length}) | sort_by(.cpu) | .[]
                | "  - \(.cpu) vCPU: \(.count) agents"' "$AGENTS_FILE" | tee -a "$REPORT_FILE"
         echo "" | tee -a "$REPORT_FILE"
-        echo "  Use the vCPU total as the sizing basis when the customer supplies" | tee -a "$REPORT_FILE"
-        echo "  the per-VM or per-node cost of this fleet." | tee -a "$REPORT_FILE"
+        echo "  Use the vCPU total as the sizing basis, together with the per-VM" | tee -a "$REPORT_FILE"
+        echo "  or per-node cost of this fleet from your infrastructure billing." | tee -a "$REPORT_FILE"
     else
         total_vcpu=0
         echo "" | tee -a "$REPORT_FILE"
         echo "Self-Hosted Agent Sizes: not reported by the API for this account." | tee -a "$REPORT_FILE"
-        echo "  Agent capabilities require pool read permission; ask the customer" | tee -a "$REPORT_FILE"
-        echo "  for the VM sizes behind the self-hosted pools." | tee -a "$REPORT_FILE"
+        echo "  Agent capabilities require pool read permission. Re-run with an" | tee -a "$REPORT_FILE"
+        echo "  account that has it, or record the VM sizes behind these pools." | tee -a "$REPORT_FILE"
     fi
 fi
 
@@ -2574,9 +2602,10 @@ else
         echo "  Basis: MEASURED across every build in the window" | tee -a "$REPORT_FILE"
     fi
     echo "" | tee -a "$REPORT_FILE"
-    echo "This is the figure to price against GitHub-hosted runner rates, after" | tee -a "$REPORT_FILE"
-    echo "applying the operating-system multipliers from section 17 and removing" | tee -a "$REPORT_FILE"
-    echo "any workload that stays on self-hosted runners." | tee -a "$REPORT_FILE"
+    echo "This is the measurement a cost model needs. Whoever prepares the" | tee -a "$REPORT_FILE"
+    echo "estimate applies current runner rates to it, after weighting by the" | tee -a "$REPORT_FILE"
+    echo "operating-system mix in section 17 and removing any workload that" | tee -a "$REPORT_FILE"
+    echo "would stay on self-hosted runners." | tee -a "$REPORT_FILE"
 
     # ---- Executed task inventory -------------------------------------------
     # The extensions list in section 10 shows what is installed. This shows what
@@ -2708,10 +2737,10 @@ if [ "$jobreq_total" -eq 0 ]; then
     echo "No agent job requests were returned." | tee -a "$REPORT_FILE"
     echo "" | tee -a "$REPORT_FILE"
     echo "The operating-system mix of hosted minutes could not be measured." | tee -a "$REPORT_FILE"
-    echo "This is the single largest cost variable, because Windows bills at 2x" | tee -a "$REPORT_FILE"
-    echo "and macOS at 10x Linux. Ask the customer for the Windows, Linux and" | tee -a "$REPORT_FILE"
-    echo "macOS split, or grant pool read permission and re-run." | tee -a "$REPORT_FILE"
-    report_warn "Agent job requests returned no data - the OS mix behind hosted minutes is UNKNOWN and must be obtained from the customer."
+    echo "This is the single largest cost variable, because Windows bills at ${MULT_WINDOWS}x" | tee -a "$REPORT_FILE"
+    echo "and macOS at ${MULT_MACOS}x Linux. Record the Windows, Linux and macOS split from" | tee -a "$REPORT_FILE"
+    echo "your pipeline definitions, or grant pool read permission and re-run." | tee -a "$REPORT_FILE"
+    report_warn "Agent job requests returned no data - the OS mix behind hosted minutes is UNKNOWN and must be established another way."
 else
     jq '
         def epoch:
@@ -2798,11 +2827,14 @@ else
 
     # Weighted factor: how many Linux-equivalent minutes one billable minute of
     # this workload costs, given the observed mix.
-    os_multiplier_factor=$(jq -rn --slurpfile s "$JOBREQ_STATS_FILE" '
+    os_multiplier_factor=$(jq -rn --slurpfile s "$JOBREQ_STATS_FILE" \
+        --argjson ml "$(numf "$MULT_LINUX")" \
+        --argjson mw "$(numf "$MULT_WINDOWS")" \
+        --argjson mm "$(numf "$MULT_MACOS")" '
         (($s[0].byOs // [])
-         | map(. + {mult: (if .os == "Windows" then 2
-                           elif .os == "macOS" then 10
-                           else 1 end)})) as $o
+         | map(. + {mult: (if .os == "Windows" then $mw
+                           elif .os == "macOS" then $mm
+                           else $ml end)})) as $o
         | ($o | map(.billableMinutes) | add // 0) as $t
         | if $t > 0
           then ((($o | map(.billableMinutes * .mult) | add // 0) / $t) * 100 | floor) / 100
@@ -2811,8 +2843,9 @@ else
 
     echo "" | tee -a "$REPORT_FILE"
     echo "Weighted multiplier for this mix: ${os_multiplier_factor}x" | tee -a "$REPORT_FILE"
-    echo "  (Linux 1x, Windows 2x, macOS 10x. A figure of 1.00 means an all-Linux" | tee -a "$REPORT_FILE"
-    echo "  estate; anything higher is the premium the current mix carries.)" | tee -a "$REPORT_FILE"
+    echo "  (Linux ${MULT_LINUX}x, Windows ${MULT_WINDOWS}x, macOS ${MULT_MACOS}x. A figure of 1.00 means an" | tee -a "$REPORT_FILE"
+    echo "  all-Linux estate; anything higher is the premium the current mix" | tee -a "$REPORT_FILE"
+    echo "  carries. Confirm these ratios against current published rates.)" | tee -a "$REPORT_FILE"
 
     echo "" | tee -a "$REPORT_FILE"
     echo "Hosted vs Self-Hosted (by job request):" | tee -a "$REPORT_FILE"
@@ -3149,7 +3182,7 @@ write_section "21. Azure DevOps Commercial Baseline"
 maybe_refresh_token
 
 # The quantities that make up the current Azure DevOps bill. Prices are
-# deliberately not applied: unit price depends on the customer's agreement and
+# deliberately not applied: unit price depends on your own agreement and
 # is not exposed by any API. These are the multiplicands only.
 
 RESOURCE_USAGE_FILE="$TEMP_DATA_DIR/resource_usage.json"
@@ -3186,9 +3219,9 @@ selfhosted_parallel_used=$(num "$(jq -r '[.[] | select(.hosted == false and .par
 
 echo "Parallel Jobs (the Azure Pipelines billing unit):" | tee -a "$REPORT_FILE"
 if [ "$(num "$(jq 'length' "$RESOURCE_USAGE_FILE" 2>/dev/null)")" -eq 0 ]; then
-    echo "  Not available to this account - ask the customer for the purchased" | tee -a "$REPORT_FILE"
+    echo "  Not available to this account - take the purchased parallel job" | tee -a "$REPORT_FILE"
     echo "  Microsoft-hosted and self-hosted parallel job counts." | tee -a "$REPORT_FILE"
-    report_warn "Parallel job entitlement could not be read - the Azure DevOps pipeline cost baseline must be supplied by the customer."
+    report_warn "Parallel job entitlement could not be read - take the Azure DevOps pipeline cost baseline from your billing statement."
 else
     jq -r '.[] | "  - \(.parallelismTag) / \(if .hosted then "Microsoft-hosted" else "self-hosted" end): purchased \(.purchasedCount // "unknown"), in use \(.usedCount // "unknown")\(if .includedMinutes != null then ", included minutes \(.includedMinutes)" else "" end)"' \
         "$RESOURCE_USAGE_FILE" | tee -a "$REPORT_FILE"
@@ -3218,13 +3251,13 @@ echo "  - Azure Artifacts storage tier and any storage overage" | tee -a "$REPOR
 echo "  - internal or partner effort operating the platform" | tee -a "$REPORT_FILE"
 
 # ========================================
-# 22. TCO INPUT SUMMARY
+# 22. MIGRATION ASSESSMENT SUMMARY
 # ========================================
-write_section "22. TCO INPUT SUMMARY"
+write_section "22. MIGRATION ASSESSMENT SUMMARY"
 
 # One page containing every figure a cost model needs, each labelled with how it
 # was obtained. Anything the API cannot answer is listed explicitly so it is
-# raised with the customer rather than silently assumed.
+# recorded as an explicit assumption rather than silently guessed.
 
 if [ "$(num "${jobreq_total:-0}")" -gt 0 ] && [ "$(num "${billable_job_minutes_month:-0}")" -gt 0 ]; then
     weighted_minutes_month=$(jq -rn \
@@ -3239,10 +3272,14 @@ total_compute_minutes_month=$(( $(num "${billable_job_minutes_month:-0}") + $(nu
 echo "Organization: $ORG" | tee -a "$REPORT_FILE"
 echo "Measurement window: $HISTORY_DAYS days from $HISTORY_START" | tee -a "$REPORT_FILE"
 echo "" | tee -a "$REPORT_FILE"
+echo "This section is the hand-over summary. If you have been asked to share" | tee -a "$REPORT_FILE"
+echo "these findings with a migration or licensing assessment, this page plus" | tee -a "$REPORT_FILE"
+echo "the JSON file is what they need." | tee -a "$REPORT_FILE"
+echo "" | tee -a "$REPORT_FILE"
 echo "Every line is labelled with its basis:" | tee -a "$REPORT_FILE"
 echo "  MEASURED     - read directly from the Azure DevOps API" | tee -a "$REPORT_FILE"
 echo "  EXTRAPOLATED - measured on a sample, scaled to the estate" | tee -a "$REPORT_FILE"
-echo "  UNKNOWN      - not exposed by the API; ask the customer" | tee -a "$REPORT_FILE"
+echo "  UNKNOWN      - not exposed by the API; supply it yourself" | tee -a "$REPORT_FILE"
 echo "" | tee -a "$REPORT_FILE"
 
 echo "A. COMPUTE - what GitHub Actions would bill" | tee -a "$REPORT_FILE"
@@ -3262,10 +3299,10 @@ fi
 printf '  %-46s %12s  %s\n' "Deployment (release) minutes / month" "${deployment_minutes_month:-0}" "MEASURED" | tee -a "$REPORT_FILE"
 printf '  %-46s %12s  %s\n' "TOTAL compute minutes / month" "$total_compute_minutes_month" "derived" | tee -a "$REPORT_FILE"
 if [ "$(num "${jobreq_total:-0}")" -gt 0 ]; then
-    printf '  %-46s %12s  %s\n' "OS weighted multiplier (Lnx1/Win2/Mac10)" "${os_multiplier_factor:-0}x" "MEASURED (${jobreq_window_days}d window)" | tee -a "$REPORT_FILE"
+    printf '  %-46s %12s  %s\n' "OS weighted multiplier (L${MULT_LINUX}/W${MULT_WINDOWS}/M${MULT_MACOS})" "${os_multiplier_factor:-0}x" "MEASURED (${jobreq_window_days}d window)" | tee -a "$REPORT_FILE"
     printf '  %-46s %12s  %s\n' "Linux-equivalent minutes / month" "${weighted_minutes_month:-0}" "derived" | tee -a "$REPORT_FILE"
 else
-    printf '  %-46s %12s  %s\n' "OS weighted multiplier" "n/a" "UNKNOWN - ask for Win/Linux/macOS split" | tee -a "$REPORT_FILE"
+    printf '  %-46s %12s  %s\n' "OS weighted multiplier" "n/a" "UNKNOWN - Win/Linux/macOS split unmeasured" | tee -a "$REPORT_FILE"
 fi
 
 echo "" | tee -a "$REPORT_FILE"
@@ -3281,7 +3318,7 @@ if [ "${agents_with_cpu:-0}" -gt 0 ]; then
 else
     printf '  %-46s %12s  %s\n' "Self-hosted fleet vCPU" "n/a" "UNKNOWN - ask for VM sizes" | tee -a "$REPORT_FILE"
 fi
-printf '  %-46s %12s  %s\n' "Self-hosted infrastructure cost" "n/a" "UNKNOWN - ask the customer" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Self-hosted infrastructure cost" "n/a" "UNKNOWN - supply this" | tee -a "$REPORT_FILE"
 
 echo "" | tee -a "$REPORT_FILE"
 echo "C. SEATS" | tee -a "$REPORT_FILE"
@@ -3297,8 +3334,8 @@ echo "D. CURRENT AZURE DEVOPS BASELINE" | tee -a "$REPORT_FILE"
 echo "----------------------------------------------------------------" | tee -a "$REPORT_FILE"
 printf '  %-46s %12s  %s\n' "MS-hosted parallel jobs purchased" "${hosted_parallel_purchased:-0}" "MEASURED" | tee -a "$REPORT_FILE"
 printf '  %-46s %12s  %s\n' "Self-hosted parallel jobs purchased" "${selfhosted_parallel_purchased:-0}" "MEASURED" | tee -a "$REPORT_FILE"
-printf '  %-46s %12s  %s\n' "Unit prices / EA discount" "n/a" "UNKNOWN - ask the customer" | tee -a "$REPORT_FILE"
-printf '  %-46s %12s  %s\n' "Artifacts storage cost" "n/a" "UNKNOWN - ask the customer" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Unit prices / EA discount" "n/a" "UNKNOWN - supply this" | tee -a "$REPORT_FILE"
+printf '  %-46s %12s  %s\n' "Artifacts storage cost" "n/a" "UNKNOWN - supply this" | tee -a "$REPORT_FILE"
 
 echo "" | tee -a "$REPORT_FILE"
 echo "E. MIGRATION EFFORT" | tee -a "$REPORT_FILE"
@@ -3320,10 +3357,12 @@ printf '  %-46s %12s  %s\n' "Approvals + gates to rebuild" "$(( env_approvals + 
 printf '  %-46s %12s  %s\n' "Integrations needing custom work" "${custom_count:-0}" "MEASURED" | tee -a "$REPORT_FILE"
 
 echo "" | tee -a "$REPORT_FILE"
-echo "F. STILL REQUIRED FROM THE CUSTOMER" | tee -a "$REPORT_FILE"
+echo "F. PLEASE PROVIDE THESE ALONGSIDE THE REPORT" | tee -a "$REPORT_FILE"
 echo "----------------------------------------------------------------" | tee -a "$REPORT_FILE"
-echo "  These cannot be derived from any Azure DevOps API. A range or a rough" | tee -a "$REPORT_FILE"
-echo "  figure is enough; document the assumption where one is unavailable." | tee -a "$REPORT_FILE"
+echo "  None of the following is exposed by any Azure DevOps API, so it cannot" | tee -a "$REPORT_FILE"
+echo "  be collected automatically. Whoever prepares the cost assessment will" | tee -a "$REPORT_FILE"
+echo "  need it. Rough figures or ranges are fine - where something is genuinely" | tee -a "$REPORT_FILE"
+echo "  unknown, say so and it will be recorded as a stated assumption." | tee -a "$REPORT_FILE"
 echo "" | tee -a "$REPORT_FILE"
 echo "  1. Cost of the self-hosted agent infrastructure (VMs, storage, network)." | tee -a "$REPORT_FILE"
 echo "  2. Azure DevOps unit prices and any enterprise agreement discount." | tee -a "$REPORT_FILE"
@@ -3333,7 +3372,8 @@ echo "     after retiring the ${dead_pipelines:-0} dormant pipelines." | tee -a 
 echo "  5. Workloads that cannot move for compliance, networking or technical" | tee -a "$REPORT_FILE"
 echo "     reasons, and therefore stay on self-hosted runners." | tee -a "$REPORT_FILE"
 echo "  6. Whether migration and professional services are in or out of scope." | tee -a "$REPORT_FILE"
-echo "  7. Any competing quote to be compared, and what it includes." | tee -a "$REPORT_FILE"
+echo "  7. The GitHub Actions unit rates current at the time of your analysis," | tee -a "$REPORT_FILE"
+echo "     plus any other vendor quotes you are comparing against." | tee -a "$REPORT_FILE"
 if [ "$(num "${jobreq_total:-0}")" -eq 0 ]; then
     echo "  8. The Windows, Linux and macOS split of pipeline minutes - this could" | tee -a "$REPORT_FILE"
     echo "     not be measured and is the largest single cost variable." | tee -a "$REPORT_FILE"
@@ -3342,7 +3382,7 @@ fi
 echo "" | tee -a "$REPORT_FILE"
 echo "RECONCILIATION NOTE" | tee -a "$REPORT_FILE"
 echo "----------------------------------------------------------------" | tee -a "$REPORT_FILE"
-echo "If the customer quotes a minute figure that differs from the numbers above," | tee -a "$REPORT_FILE"
+echo "If another report quotes a minute figure that differs from the numbers above," | tee -a "$REPORT_FILE"
 echo "establish which measure it is before comparing anything:" | tee -a "$REPORT_FILE"
 echo "  - build wall-clock            -> section 12 (${minutes_per_month:-0} /month)" | tee -a "$REPORT_FILE"
 echo "  - job execution time          -> section 16 (${raw_job_minutes_month:-0} /month)" | tee -a "$REPORT_FILE"
@@ -3350,6 +3390,44 @@ echo "  - job time with Actions round -> section 16 (${billable_job_minutes_mont
 echo "  - agent lease or availability -> not measured here; ask how it was produced" | tee -a "$REPORT_FILE"
 echo "A figure that matches none of these is most likely agent availability or a" | tee -a "$REPORT_FILE"
 echo "different reporting period, and must not have an Actions rate applied to it." | tee -a "$REPORT_FILE"
+
+# Sharing is the point of this report, so state plainly what is and is not in
+# it. An administrator should be able to satisfy themselves in one screen that
+# nothing sensitive leaves the organization.
+echo "" | tee -a "$REPORT_FILE"
+echo "BEFORE YOU SHARE THIS REPORT" | tee -a "$REPORT_FILE"
+echo "----------------------------------------------------------------" | tee -a "$REPORT_FILE"
+echo "This report was produced by read-only API calls. Nothing was created," | tee -a "$REPORT_FILE"
+echo "changed or deleted in Azure DevOps." | tee -a "$REPORT_FILE"
+echo "" | tee -a "$REPORT_FILE"
+echo "This text report CONTAINS:" | tee -a "$REPORT_FILE"
+echo "  - counts, durations, dates and aggregate statistics" | tee -a "$REPORT_FILE"
+echo "  - names of projects, repositories, pipelines, agent pools," | tee -a "$REPORT_FILE"
+echo "    environments, variable groups and service connections" | tee -a "$REPORT_FILE"
+echo "  - names of installed extensions and the tasks pipelines execute" | tee -a "$REPORT_FILE"
+echo "  - display names of the people who created variable groups and" | tee -a "$REPORT_FILE"
+echo "    service connections" | tee -a "$REPORT_FILE"
+if [ "$SCAN_LARGE_FILES" = "1" ]; then
+    echo "  - paths of large files found in repositories (SCAN_LARGE_FILES=1)" | tee -a "$REPORT_FILE"
+fi
+echo "" | tee -a "$REPORT_FILE"
+echo "It does NOT contain:" | tee -a "$REPORT_FILE"
+echo "  - any secret, password, token, certificate or variable VALUE" | tee -a "$REPORT_FILE"
+echo "  - source code or file contents" | tee -a "$REPORT_FILE"
+echo "  - work item titles, descriptions or comments (only a count is read)" | tee -a "$REPORT_FILE"
+echo "  - build logs, test output or commit messages" | tee -a "$REPORT_FILE"
+echo "" | tee -a "$REPORT_FILE"
+echo "PERSONAL DATA - read this before sending anything externally:" | tee -a "$REPORT_FILE"
+echo "  The users CSV written alongside this report lists every user by" | tee -a "$REPORT_FILE"
+echo "  DISPLAY NAME and EMAIL ADDRESS. That file is for your own internal" | tee -a "$REPORT_FILE"
+echo "  review. A cost or migration assessment needs only the user COUNTS," | tee -a "$REPORT_FILE"
+echo "  which are already in this text report and in the JSON file, so do" | tee -a "$REPORT_FILE"
+echo "  not send the users CSV unless you have a specific reason to." | tee -a "$REPORT_FILE"
+echo "" | tee -a "$REPORT_FILE"
+echo "Project and pipeline names can also be commercially sensitive. Review" | tee -a "$REPORT_FILE"
+echo "this report before sending it outside your organization and redact any" | tee -a "$REPORT_FILE"
+echo "names you would rather not disclose - the counts and minutes stay" | tee -a "$REPORT_FILE"
+echo "usable without them." | tee -a "$REPORT_FILE"
 
 # ========================================
 # SUMMARY
@@ -3490,6 +3568,9 @@ jq -n \
   --argjson jobReqTotal "$(num "${jobreq_total:-0}")" \
   --argjson jobReqDays "$(numf "${jobreq_window_days:-0}")" \
   --argjson osFactor "$(numf "${os_multiplier_factor:-0}")" \
+  --argjson multLinux "$(numf "$MULT_LINUX")" \
+  --argjson multWindows "$(numf "$MULT_WINDOWS")" \
+  --argjson multMacos "$(numf "$MULT_MACOS")" \
   --argjson weightedMonth "$(num "${weighted_minutes_month:-0}")" \
   --argjson avgConcurrency "$(numf "${avg_concurrency:-0}")" \
   --argjson fleetVcpu "$(num "${total_vcpu:-0}")" \
@@ -3636,6 +3717,7 @@ jq -n \
         jobRequestsObserved: $jobReqTotal,
         observedWindowDays: $jobReqDays,
         weightedMultiplier: $osFactor,
+        multipliersApplied: { linux: $multLinux, windows: $multWindows, macos: $multMacos },
         linuxEquivalentMinutesPerMonth: $weightedMonth,
         byOperatingSystem: ($osMix[0] // []),
         byImage: ($imageMix[0] // [])
@@ -3675,7 +3757,7 @@ jq -n \
         selfHostedParallelJobsInUse: $selfUsed,
         rawResourceUsage: ($resourceUsage[0] // [])
       },
-      requiredFromCustomer: [
+      inputsYouMustSupply: [
         "self-hosted agent infrastructure cost",
         "Azure DevOps unit prices and enterprise agreement discount",
         "internal or partner effort operating the platform (FTE)",

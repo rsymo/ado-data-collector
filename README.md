@@ -27,7 +27,9 @@ The key distinction the report enforces is that **Azure DevOps minutes and GitHu
 
 A build that fans out to six parallel jobs therefore bills roughly six times its wall-clock duration. Applying an Actions rate to a raw Azure DevOps minute figure will produce a materially wrong number. Section 16 measures the real expansion ratio from build timelines, section 17 measures the operating-system mix, and section 22 combines them into a single Linux-equivalent figure that can safely be priced.
 
-Section 22 also lists, explicitly, the inputs that no Azure DevOps API can supply — self-hosted infrastructure cost, unit prices, internal effort, compliance blockers and competing quotes. Those have to come from the customer.
+Section 22 also lists, explicitly, the inputs that no Azure DevOps API can supply — self-hosted infrastructure cost, unit prices, internal effort, compliance blockers and any competing quotes. Those have to be provided separately.
+
+If you have been asked to run this collector so that someone else can build the cost model, section 22 plus the JSON file is the hand-over. Read the **Before you share this report** block at the end of it first: it states exactly what the report contains, confirms that no secret values are ever collected, and flags the one output file that carries personal data.
 
 ## Run it
 
@@ -75,6 +77,9 @@ ORG="your-org-name" HISTORY_DAYS=7 DEBUG=1 ./ado-data-collector.sh
 | `MAX_BUILDS_PER_PROJECT` | `20000` | Safety cap on builds fetched per project |
 | `SKIP_TIMELINE` | `0` | Skip job-level timeline collection (section 16). Faster, but removes the only Actions-comparable minute figure |
 | `TIMELINE_SAMPLE_MAX` | `1500` | Maximum build timelines to read. Above this the collector samples evenly and extrapolates, reporting the sample size |
+| `MULT_LINUX` | `1` | Cost weighting for Linux job minutes |
+| `MULT_WINDOWS` | `2` | Cost weighting for Windows job minutes |
+| `MULT_MACOS` | `10` | Cost weighting for macOS job minutes. Defaults reflect GitHub-hosted standard runner ratios at the time of writing — confirm against current pricing |
 | `TOKEN_MAX_AGE` | `2400` | Seconds before the Azure AD token is refreshed |
 | `DEBUG` | `0` | Print API calls and diagnostic details |
 
@@ -102,7 +107,7 @@ The generated `ado-data-report-RUN.txt` contains these sections:
 | 19: Approvals, gates and secrets | YAML environment checks, classic release approvals and gates, secret variables, secure files and service connections — all manual rebuild work |
 | 20: Migration complexity | Active pipelines grouped simple, moderate and complex from observed jobs, tasks and extension tasks |
 | 21: Commercial baseline | Purchased and in-use parallel jobs and licence entitlement quantities |
-| 22: TCO input summary | One answer sheet, each figure labelled `MEASURED`, `EXTRAPOLATED` or `UNKNOWN`, plus the list of inputs to request from the customer |
+| 22: Migration assessment summary | One hand-over page, each figure labelled `MEASURED`, `EXTRAPOLATED` or `UNKNOWN`, plus the inputs no API can supply and a statement of what the report does and does not contain |
 
 ### Admin review guide
 
@@ -111,20 +116,20 @@ The generated `ado-data-report-RUN.txt` contains these sections:
 3. **Separate active from inactive.** Use 30/60/90-day user activity and the build-history window. Treat “never signed in” users and dormant pipelines as review queues, not automatic deletion lists.
 4. **Find the operating burden.** Review self-hosted agents, agent operating systems, service connections, extensions, active users, queue wait, and peak concurrency.
 5. **Assign owners.** Every cleanup candidate, security alert, service connection, and `CUSTOM` integration should have a named owner and a follow-up decision.
-6. **Build the cost case.** Read section 22 last. It restates every figure a cost model needs, labelled by how it was obtained, and ends with the short list of inputs that must come from the customer.
+6. **Read the hand-over page.** Section 22 restates every figure a cost model needs, labelled by how it was obtained. It ends with the inputs no Azure DevOps API can supply, and a plain statement of what the report does and does not contain — read that before sharing the report outside your organization.
 
 ## Output files
 
 Each run uses the same `RUN` identifier (`YYYYMMDD-HHMMSS-XXXXX`):
 
-- `ado-data-report-RUN.txt` — human-readable report for administrators
+- `ado-data-report-RUN.txt` — human-readable report for administrators, and the file to share if someone else is building the assessment
 - `ado-sizing-RUN.json` — structured export for dashboards, models, or automation
 - `ado-users-RUN.csv` — user display name, access level, license type, and last-access data
 - `ado-secret-scanning-RUN.txt`, `.csv`, `.json` — detailed secret-alert exports when alerts are found
 
 The JSON top-level keys are `meta`, `content`, `infrastructure`, `licensing`, `migrationEffort`, `integrations`, `operatingModel`, `security`, and `tco`.
 
-`tco` contains `jobCompute`, `runnerMix`, `deployments`, `approvalsAndSecrets`, `complexity`, `commercial`, and `requiredFromCustomer`. The `basis` field on `jobCompute`, `runnerMix` and `complexity` reports whether a figure was measured, extrapolated from a sample, or unavailable — check it before using any of them.
+`tco` contains `jobCompute`, `runnerMix`, `deployments`, `approvalsAndSecrets`, `complexity`, `commercial`, and `inputsYouMustSupply`. The `basis` field on `jobCompute`, `runnerMix` and `complexity` reports whether a figure was measured, extrapolated from a sample, or unavailable — check it before using any of them.
 
 Useful examples:
 
@@ -139,7 +144,7 @@ jq '{
   expansionRatio: .tco.jobCompute.billableToWallClockRatio,
   osMultiplier: .tco.runnerMix.weightedMultiplier,
   linuxEquivalentMinutesPerMonth: .tco.runnerMix.linuxEquivalentMinutesPerMonth,
-  stillNeeded: .tco.requiredFromCustomer
+  stillNeeded: .tco.inputsYouMustSupply
 }' ado-sizing-*.json
 
 # Current-state headline numbers
@@ -174,7 +179,8 @@ Limitations specific to the TCO sections:
 - **Concurrency is measured at build level.** Average and peak concurrent *builds* are exact and taken from the full population. Concurrent *jobs* will be higher, in proportion to average jobs per build.
 - **Complexity grouping is a heuristic.** It classifies from observed jobs, distinct tasks and extension tasks, and covers only pipelines that ran during the window. Pipelines that did not run are reported separately rather than assumed simple.
 - **Approvals and gates are capped.** Environment checks require one call per environment; the collector inspects the first 300 and warns when there are more, making those counts a lower bound.
-- **No prices are applied anywhere.** The collector reports quantities only. Unit prices, discounts and infrastructure costs depend on the customer's agreements and are listed in section 22 as inputs to request.
+- **No prices are applied anywhere.** The collector reports quantities only. Unit prices, discounts and infrastructure costs depend on your own agreements and are listed in section 22 as inputs to provide separately.
+- **Cost multipliers are assumptions, not live pricing.** `MULT_LINUX`, `MULT_WINDOWS` and `MULT_MACOS` default to the GitHub-hosted standard runner ratios published at the time of writing. Rates change and vary by plan and runner size, so confirm them against current pricing and override them if they differ. The values actually used are recorded in the JSON under `tco.runnerMix.multipliersApplied`.
 
 The collector complements [`gh actions-importer audit azure-devops`](https://docs.github.com/en/actions/migrating-to-github-actions/using-github-actions-importer). The Importer assesses individual pipeline conversion compatibility; this project provides the broader estate, activity, ownership, and operating-model inventory.
 
