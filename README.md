@@ -86,6 +86,7 @@ ORG="your-org-name" HISTORY_DAYS=7 DEBUG=1 ./ado-data-collector.sh
 | `SKIP_TIMELINE` | `0` | Skip job-level timeline collection (section 16). Faster, but removes the only Actions-comparable minute figure |
 | `TIMELINE_SAMPLE_MAX` | `1500` | Maximum build timelines to read. Above this the collector samples evenly and extrapolates, reporting the sample size |
 | `EXPORT_USER_DETAILS` | `0` | Set to `1` to additionally write a per-user CSV containing display names and email addresses. Off by default so the standard output contains no personal data |
+| `EXPORT_SECRET_DETAILS` | `0` | Set to `1` to additionally write per-alert secret scanning files naming the file path, line number and branch of each detected credential. Off by default; alert **counts** are always reported. Also adds one API call per alert |
 | `MULT_LINUX` | `1` | Cost weighting for Linux job minutes |
 | `MULT_WINDOWS` | `2` | Cost weighting for Windows job minutes |
 | `MULT_MACOS` | `10` | Cost weighting for macOS job minutes. Defaults reflect GitHub-hosted standard runner ratios at the time of writing — confirm against current pricing |
@@ -134,7 +135,7 @@ Each run uses the same `RUN` identifier (`YYYYMMDD-HHMMSS-XXXXX`):
 - `ado-data-report-RUN.txt` — human-readable report for administrators, and the file to share if someone else is building the assessment
 - `ado-sizing-RUN.json` — structured export for dashboards, models, or automation
 - `ado-users-RUN.csv` — **only when `EXPORT_USER_DETAILS=1`.** Per-user display name, email address, access level, licence type and last-access date. This is personal data; see [Personal data](#personal-data)
-- `ado-secret-scanning-RUN.txt`, `.csv`, `.json` — detailed secret-alert exports when alerts are found
+- `ado-secret-scanning-RUN.txt`, `.csv`, `.json` — **only when `EXPORT_SECRET_DETAILS=1`.** Per-alert detail naming the file path, line number and branch of each detected credential (never the value). This is security-sensitive; see [Personal data](#personal-data)
 
 The JSON top-level keys are `meta`, `content`, `infrastructure`, `licensing`, `migrationEffort`, `integrations`, `operatingModel`, `security`, and `tco`.
 
@@ -207,7 +208,11 @@ No secret, password, token, certificate or variable **value** is ever read. Work
 
 Set `EXPORT_USER_DETAILS=1` to additionally write `ado-users-RUN.csv`, which lists every user by display name and email address. That file exists for internal administrative review, such as licence reconciliation or offboarding. It is **not** required for estate sizing or cost modelling, and it should not be included when sharing findings outside your organization.
 
-If secret scanning alerts are found, the `ado-secret-scanning-*` files record the file paths and line numbers where credentials were detected — never the values. Treat those as security-sensitive and share them only with the team remediating the alerts.
+### Secret scanning detail
+
+By default the report gives **counts only** for secret, code and dependency scanning alerts. That is all estate sizing needs, and it means the report cannot be used to locate an unremediated credential.
+
+Set `EXPORT_SECRET_DETAILS=1` to additionally write the `ado-secret-scanning-*` files, which record the file path, line number and branch of each detected credential — never the value. Those files are effectively a map of where your unremediated secrets are. They exist for the team remediating the alerts, are **not** required for estate sizing, and should not be included when sharing findings outside your organization.
 
 ## Troubleshooting
 

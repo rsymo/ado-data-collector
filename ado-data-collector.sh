@@ -67,6 +67,12 @@ TIMELINE_SAMPLE_MAX=${TIMELINE_SAMPLE_MAX:-1500}
 # never needed to size an estate. Set EXPORT_USER_DETAILS=1 to additionally
 # write the per-user CSV for internal use; by default only counts are produced.
 EXPORT_USER_DETAILS=${EXPORT_USER_DETAILS:-0}
+# Secret scanning detail identifies the file path, line number and branch where
+# each credential was detected. That is security-sensitive: it is a map of where
+# the unremediated secrets are. Alert COUNTS are always reported; set
+# EXPORT_SECRET_DETAILS=1 to additionally write the per-alert files, which also
+# costs one extra API call per alert.
+EXPORT_SECRET_DETAILS=${EXPORT_SECRET_DETAILS:-0}
 MULT_LINUX=${MULT_LINUX:-1}
 MULT_WINDOWS=${MULT_WINDOWS:-2}
 MULT_MACOS=${MULT_MACOS:-10}
@@ -1304,22 +1310,25 @@ if [ "$advsec_test" != "API_ERROR" ] && echo "$advsec_test" | jq empty 2>/dev/nu
     echo "Advanced Security is enabled for this organization" | tee -a "$REPORT_FILE"
     echo "" | tee -a "$REPORT_FILE"
     
-    # Initialize secret scanning detailed report
-    echo "Azure DevOps Secret Scanning Detailed Report" > "$SECRET_SCANNING_REPORT"
-    echo "Organization: $ORG" >> "$SECRET_SCANNING_REPORT"
-    echo "Generated: $(date)" >> "$SECRET_SCANNING_REPORT"
-    echo "" >> "$SECRET_SCANNING_REPORT"
-    echo "========================================" >> "$SECRET_SCANNING_REPORT"
-    echo "" >> "$SECRET_SCANNING_REPORT"
+    # Initialize secret scanning detail files only when explicitly requested.
+    # Alert counts are collected either way.
+    if [ "$EXPORT_SECRET_DETAILS" = "1" ]; then
+        echo "Azure DevOps Secret Scanning Detailed Report" > "$SECRET_SCANNING_REPORT"
+        echo "Organization: $ORG" >> "$SECRET_SCANNING_REPORT"
+        echo "Generated: $(date)" >> "$SECRET_SCANNING_REPORT"
+        echo "" >> "$SECRET_SCANNING_REPORT"
+        echo "========================================" >> "$SECRET_SCANNING_REPORT"
+        echo "" >> "$SECRET_SCANNING_REPORT"
     
-    # Initialize CSV file with headers
-    echo "Project,Repository,Repository ID,Alert ID,Secret Type,Severity,Confidence,State,Validation Status,Validation Message,File Path,Start Line,End Line,Branch,Introduced Date,First Seen,Last Seen,Detection Tools,Alert URL" > "$SECRET_SCANNING_CSV"
+        # Initialize CSV file with headers
+        echo "Project,Repository,Repository ID,Alert ID,Secret Type,Severity,Confidence,State,Validation Status,Validation Message,File Path,Start Line,End Line,Branch,Introduced Date,First Seen,Last Seen,Detection Tools,Alert URL" > "$SECRET_SCANNING_CSV"
     
-    # Initialize JSON file with metadata and empty alerts array
-    jq -n \
-        --arg org "$ORG" \
-        --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '{organization: $org, generated: $generated, alerts: []}' > "$SECRET_SCANNING_JSON"
+        # Initialize JSON file with metadata and empty alerts array
+        jq -n \
+            --arg org "$ORG" \
+            --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{organization: $org, generated: $generated, alerts: []}' > "$SECRET_SCANNING_JSON"
+    fi
     
     # Iterate through all projects and their repositories
     for project in "${projects[@]}"; do
@@ -1354,8 +1363,9 @@ if [ "$advsec_test" != "API_ERROR" ] && echo "$advsec_test" | jq empty 2>/dev/nu
                     secret_count=$(echo "$secret_alerts" | jq '.count // 0' 2>/dev/null || echo "0")
                     [ "$DEBUG" = "1" ] && echo "[DEBUG] Secret alerts response: $secret_alerts" >&2
                     
-                    # Export detailed secret scanning information if alerts are found
-                    if [ "$secret_count" -gt 0 ]; then
+                    # Export detailed secret scanning information if alerts are
+                    # found AND per-alert detail was explicitly requested.
+                    if [ "$secret_count" -gt 0 ] && [ "$EXPORT_SECRET_DETAILS" = "1" ]; then
                         echo "----------------------------------------" >> "$SECRET_SCANNING_REPORT"
                         echo "Project: $project" >> "$SECRET_SCANNING_REPORT"
                         echo "Repository: $repo_name" >> "$SECRET_SCANNING_REPORT"
@@ -1560,9 +1570,18 @@ if [ "$advsec_test" != "API_ERROR" ] && echo "$advsec_test" | jq empty 2>/dev/nu
     # Add reference to detailed secret scanning report if secrets were found
     if [ "$total_secret_alerts" -gt 0 ]; then
         echo "" | tee -a "$REPORT_FILE"
-        echo "Detailed secret scanning report saved to: $SECRET_SCANNING_REPORT" | tee -a "$REPORT_FILE"
-        echo "Secret scanning CSV (Excel-compatible) saved to: $SECRET_SCANNING_CSV" | tee -a "$REPORT_FILE"
-        echo "Secret scanning JSON (machine-readable) saved to: $SECRET_SCANNING_JSON" | tee -a "$REPORT_FILE"
+        if [ "$EXPORT_SECRET_DETAILS" = "1" ]; then
+            echo "Detailed secret scanning report saved to: $SECRET_SCANNING_REPORT" | tee -a "$REPORT_FILE"
+            echo "Secret scanning CSV (Excel-compatible) saved to: $SECRET_SCANNING_CSV" | tee -a "$REPORT_FILE"
+            echo "Secret scanning JSON (machine-readable) saved to: $SECRET_SCANNING_JSON" | tee -a "$REPORT_FILE"
+            echo "  These files record WHERE each credential was found (file path," | tee -a "$REPORT_FILE"
+            echo "  line and branch), never the value. Treat them as security-" | tee -a "$REPORT_FILE"
+            echo "  sensitive and share only with the remediation team." | tee -a "$REPORT_FILE"
+        else
+            echo "Per-alert detail was NOT exported. The counts above are all that" | tee -a "$REPORT_FILE"
+            echo "  estate review requires. Set EXPORT_SECRET_DETAILS=1 to write the" | tee -a "$REPORT_FILE"
+            echo "  file paths and line numbers for the remediation team." | tee -a "$REPORT_FILE"
+        fi
     fi
 else
     echo "Advanced Security is NOT enabled for this organization" | tee -a "$REPORT_FILE"
@@ -3440,6 +3459,7 @@ echo "  - source code or file contents" | tee -a "$REPORT_FILE"
 echo "  - work item titles, descriptions or comments (only a count is read)" | tee -a "$REPORT_FILE"
 echo "  - build logs, test output or commit messages" | tee -a "$REPORT_FILE"
 echo "  - names or email addresses of individual people" | tee -a "$REPORT_FILE"
+echo "  - the location of any secret scanning finding (counts only)" | tee -a "$REPORT_FILE"
 echo "" | tee -a "$REPORT_FILE"
 echo "People appear only as COUNTS (licence totals, active users, distinct" | tee -a "$REPORT_FILE"
 echo "pipeline authors). No individual is identified." | tee -a "$REPORT_FILE"
@@ -3451,12 +3471,14 @@ if [ "$EXPORT_USER_DETAILS" = "1" ]; then
     echo "  this report and is not needed for estate sizing - keep it" | tee -a "$REPORT_FILE"
     echo "  internal and do not include it when sharing these findings." | tee -a "$REPORT_FILE"
 fi
-if [ "$(num "${total_secret_alerts:-0}")" -gt 0 ]; then
+if [ "$EXPORT_SECRET_DETAILS" = "1" ]; then
     echo "" | tee -a "$REPORT_FILE"
-    echo "Note: secret scanning findings were written to separate files. Those" | tee -a "$REPORT_FILE"
-    echo "  identify FILE PATHS AND LINE NUMBERS where credentials were detected" | tee -a "$REPORT_FILE"
-    echo "  (never the values). Treat them as security-sensitive and share them" | tee -a "$REPORT_FILE"
-    echo "  only with the team remediating those alerts." | tee -a "$REPORT_FILE"
+    echo "EXCEPTION - you ran with EXPORT_SECRET_DETAILS=1:" | tee -a "$REPORT_FILE"
+    echo "  Separate secret scanning files were written identifying the FILE" | tee -a "$REPORT_FILE"
+    echo "  PATH, LINE NUMBER and BRANCH of each detected credential (never the" | tee -a "$REPORT_FILE"
+    echo "  values). That is a map of where your unremediated secrets are. It" | tee -a "$REPORT_FILE"
+    echo "  is not part of this report and is not needed for estate sizing -" | tee -a "$REPORT_FILE"
+    echo "  keep it internal and do not include it when sharing these findings." | tee -a "$REPORT_FILE"
 fi
 echo "" | tee -a "$REPORT_FILE"
 echo "Project and pipeline names can still be commercially sensitive. Review" | tee -a "$REPORT_FILE"
@@ -3836,7 +3858,7 @@ echo "Report saved to: $REPORT_FILE" | tee -a "$REPORT_FILE"
 [ -s "$SIZING_JSON" ] && echo "Structured sizing data saved to: $SIZING_JSON" | tee -a "$REPORT_FILE"
 [ "$EXPORT_USER_DETAILS" = "1" ] && [ -s "$USER_CSV" ] && \
     echo "User export saved to: $USER_CSV (contains personal data - keep internal)" | tee -a "$REPORT_FILE"
-if [ "$total_secret_alerts" -gt 0 ] && [ -f "$SECRET_SCANNING_REPORT" ]; then
+if [ "$EXPORT_SECRET_DETAILS" = "1" ] && [ "$total_secret_alerts" -gt 0 ] && [ -f "$SECRET_SCANNING_REPORT" ]; then
     echo "Secret scanning details saved to: $SECRET_SCANNING_REPORT" | tee -a "$REPORT_FILE"
     echo "Secret scanning CSV saved to: $SECRET_SCANNING_CSV" | tee -a "$REPORT_FILE"
     echo "Secret scanning JSON saved to: $SECRET_SCANNING_JSON" | tee -a "$REPORT_FILE"
