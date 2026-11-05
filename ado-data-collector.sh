@@ -1052,10 +1052,10 @@ write_section "3. Repositories Over 1GB (API-Reported Size)"
 echo "Analyzing repository sizes from Azure DevOps API..." | tee -a "$REPORT_FILE"
 
 large_repos=0
-ONE_GB_KB=1048576  # 1GB in kilobytes (Azure DevOps API returns size in KB)
+ONE_GB_BYTES=1073741824  # 1GB in bytes (GitRepository.size is the compressed size in bytes)
 
 if [ -f "$REPO_DETAILS_FILE" ]; then
-    large_repos_json=$(jq "[.[] | select(.size != null and (.size | tonumber) > $ONE_GB_KB)]" "$REPO_DETAILS_FILE")
+    large_repos_json=$(jq "[.[] | select(.size != null and (.size | tonumber) > $ONE_GB_BYTES)]" "$REPO_DETAILS_FILE")
     large_repos=$(echo "$large_repos_json" | jq 'length')
     
     echo "Repositories over 1GB: $large_repos" | tee -a "$REPORT_FILE"
@@ -1063,7 +1063,7 @@ if [ -f "$REPO_DETAILS_FILE" ]; then
     if [ "$large_repos" -gt 0 ]; then
         echo "" | tee -a "$REPORT_FILE"
         echo "Large Repository Details:" | tee -a "$REPORT_FILE"
-        echo "$large_repos_json" | jq -r '.[] | "\(.project)/\(.name): \((.size/1024/1024*100|floor)/100)GB"' | tee -a "$REPORT_FILE"
+        echo "$large_repos_json" | jq -r '.[] | "\(.project)/\(.name): \((.size/1024/1024/1024*100|floor)/100)GB"' | tee -a "$REPORT_FILE"
     fi
 else
     echo "WARNING: Could not analyze repository sizes - no data available" | tee -a "$REPORT_FILE"
@@ -1078,8 +1078,8 @@ if [ -f "$REPO_DETAILS_FILE" ]; then
     # Check if any repos have size data
     has_size=$(jq 'any(.size != null)' "$REPO_DETAILS_FILE")
     if [ "$has_size" = "true" ]; then
-        # Size is in KB, so divide by 1024 to get MB
-        largest_repo=$(jq -r 'max_by(.size // 0) | "\(.project)/\(.name): \((.size/1024*100|floor)/100)MB"' "$REPO_DETAILS_FILE")
+        # Size is in bytes, so divide by 1024^2 to get MB
+        largest_repo=$(jq -r 'max_by(.size // 0) | "\(.project)/\(.name): \((.size/1024/1024*100|floor)/100)MB"' "$REPO_DETAILS_FILE")
         echo "Largest Repository: $largest_repo" | tee -a "$REPORT_FILE"
     else
         echo "No repository size data available" | tee -a "$REPORT_FILE"
