@@ -4160,7 +4160,7 @@ sizing_json_rc=$?
 # stopped this file being written on every run.
 if [ "$sizing_json_rc" -ne 0 ] || [ ! -s "$SIZING_JSON" ]; then
     sizing_json_why=$(grep -m1 . "$SIZING_JSON_ERR" 2>/dev/null | sed 's/:[[:space:]]*$//')
-    report_warn "JSON sizing export failed - $SIZING_JSON was not written (jq exit $sizing_json_rc): ${sizing_json_why:-no error output}. Text report figures are unaffected."
+    echo "[WARN] JSON sizing export failed - $SIZING_JSON was not written (jq exit $sizing_json_rc): ${sizing_json_why:-no error output}. Text report figures are unaffected." | tee -a "$REPORT_FILE" >&2
     if [ -s "$SIZING_JSON_ERR" ]; then
         echo "jq error output:" | tee -a "$REPORT_FILE" >&2
         head -n 20 "$SIZING_JSON_ERR" | sed 's/^/  /' | tee -a "$REPORT_FILE" >&2

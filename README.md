@@ -256,6 +256,6 @@ Set `EXPORT_SECRET_DETAILS=1` to additionally write the `ado-secret-scanning-*` 
 - **The run is slow:** use `HISTORY_DAYS=30` or `SKIP_BUILD_HISTORY=1`; large-file scanning requires repository clones and is slower.
 - **Too few pipelines appear active:** increase `HISTORY_DAYS` to include infrequent release trains.
 - **`jq` is missing:** install it with your operating system package manager.
-- **`ado-sizing-*.json` is missing:** the export failed. The jq error is printed under the warning and listed in **DATA COMPLETENESS**; include it when opening an issue. The text report is still complete.
+- **`ado-sizing-*.json` is missing:** the export failed. The jq error is printed under the warning in the text report and console; include it when opening an issue. This export-only failure is separate from collection warnings in **DATA COMPLETENESS**, and the text report figures are unaffected.
 
 Open an issue in this repository with the command used, the affected section, and the non-sensitive error output.
