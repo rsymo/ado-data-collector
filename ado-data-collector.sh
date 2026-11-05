@@ -91,7 +91,7 @@ API_PACING_MS=${API_PACING_MS:-0}
 MULT_LINUX=${MULT_LINUX:-1}
 MULT_WINDOWS=${MULT_WINDOWS:-2}
 MULT_MACOS=${MULT_MACOS:-10}
-# Seconds before the Azure AD token is proactively refreshed. Defaulted here
+# Seconds before the Entra ID token is proactively refreshed. Defaulted here
 # (not just at the refresh helper) so it can be validated with the other
 # numeric settings below.
 TOKEN_MAX_AGE=${TOKEN_MAX_AGE:-2400}
@@ -228,10 +228,10 @@ trap on_terminating_signal INT TERM
 API_VERSION="7.1"
 
 # -------- AUTHENTICATION --------
-# Get Azure AD Bearer token using Azure CLI
+# Get Entra ID Bearer token using Azure CLI
 # Azure DevOps resource ID: 499b84ac-1321-427f-aa17-267ca6975798
 
-echo "Authenticating with Azure AD..."
+echo "Authenticating with Microsoft Entra ID..."
 
 if ! command -v az &> /dev/null; then
     echo "ERROR: Azure CLI is not installed"
@@ -250,7 +250,7 @@ fi
 ADO_TOKEN=$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv 2>/dev/null)
 
 if [ -z "$ADO_TOKEN" ]; then
-    echo "ERROR: Failed to get Azure AD token for Azure DevOps"
+    echo "ERROR: Failed to get Microsoft Entra ID token for Azure DevOps"
     echo "Please ensure you have access to Azure DevOps organization: $ORG"
     exit 1
 fi
@@ -400,10 +400,10 @@ EOF
 # Initialize curl config on first call
 create_curl_config
 
-# Function to refresh Azure AD token for long-running operations
+# Function to refresh Entra ID token for long-running operations
 # Tokens typically expire after 1 hour, so refresh before long operations
 refresh_token() {
-    [ "$DEBUG" = "1" ] && echo "[DEBUG] Refreshing Azure AD token..." >&2
+    [ "$DEBUG" = "1" ] && echo "[DEBUG] Refreshing Microsoft Entra ID token..." >&2
     local new_token=$(az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798 --query accessToken -o tsv 2>/dev/null </dev/null)
     if [ -n "$new_token" ]; then
         ADO_TOKEN="$new_token"
@@ -423,7 +423,7 @@ refresh_token() {
 
 # Refresh the token only when it is old enough to be worth replacing.
 # Called at the start of every section so long runs never fail mid-collection
-# on an expired token (Azure AD tokens last ~60 minutes).
+# on an expired token (Entra ID tokens last ~60 minutes).
 TOKEN_ISSUED_AT=$(date +%s)
 TOKEN_MAX_AGE=${TOKEN_MAX_AGE:-2400}
 
@@ -1212,7 +1212,7 @@ if [ "$SCAN_LARGE_FILES" = "1" ] && command -v git &> /dev/null; then
             cd "$repo_temp_dir"
             
             # Clone as bare repository (faster, includes all history)
-            # Use Azure AD Bearer token with http.extraHeader for authentication, securely via a temporary file
+            # Use Entra ID Bearer token with http.extraHeader for authentication, securely via a temporary file
             header_file="$repo_temp_dir/git_header.txt"
             repo_encoded=$(url_encode "$repo_name")
             clone_url="https://dev.azure.com/$ORG/$project_encoded/_git/$repo_encoded"
@@ -1524,7 +1524,7 @@ echo "Checking for Azure DevOps Advanced Security alerts..." | tee -a "$REPORT_F
 
 # Note: Advanced Security is a paid add-on feature in Azure DevOps
 # API: https://advsec.dev.azure.com/{org}/_apis/...
-# Uses the same Azure AD Bearer token for authentication
+# Uses the same Entra ID Bearer token for authentication
 
 total_secret_alerts=0
 total_dependency_alerts=0
