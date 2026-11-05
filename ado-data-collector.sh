@@ -4139,7 +4139,7 @@ jq -n \
         selfHostedParallelJobsInUse: $selfUsed,
         rawResourceUsage: ($resourceUsage[0] // [])
       },
-      inputsYouMustSupply: [
+      inputsYouMustSupply: ([
         "self-hosted agent infrastructure cost",
         "Azure DevOps unit prices and enterprise agreement discount",
         "internal or partner effort operating the platform (FTE)",
@@ -4150,7 +4150,7 @@ jq -n \
       ]
         + (if $jobReqTotal == 0
            then ["Windows / Linux / macOS split of pipeline minutes"]
-           else [] end)
+           else [] end))
     }
   }' > "$SIZING_JSON" 2>/dev/null
 
