@@ -3873,6 +3873,7 @@ echo "Repositories with Security Alerts: $repos_with_alerts" | tee -a "$REPORT_F
 # ========================================
 # Emitted as a single JSON document so a cost model can consume the figures
 # directly instead of scraping the text report.
+SIZING_JSON_ERR="$TEMP_DATA_DIR/sizing_json.err"
 jq -n \
   --arg org "$ORG" \
   --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -4152,10 +4153,18 @@ jq -n \
            then ["Windows / Linux / macOS split of pipeline minutes"]
            else [] end))
     }
-  }' > "$SIZING_JSON" 2>/dev/null
+  }' > "$SIZING_JSON" 2>"$SIZING_JSON_ERR"
+sizing_json_rc=$?
 
-if [ ! -s "$SIZING_JSON" ]; then
-    echo "WARNING: Failed to generate structured JSON export" | tee -a "$REPORT_FILE"
+# Keep jq's own error: a bare "failed" message hid a jq syntax error that
+# stopped this file being written on every run.
+if [ "$sizing_json_rc" -ne 0 ] || [ ! -s "$SIZING_JSON" ]; then
+    sizing_json_why=$(grep -m1 . "$SIZING_JSON_ERR" 2>/dev/null | sed 's/:[[:space:]]*$//')
+    echo "[WARN] JSON sizing export failed - $SIZING_JSON was not written (jq exit $sizing_json_rc): ${sizing_json_why:-no error output}. Text report figures are unaffected." | tee -a "$REPORT_FILE" >&2
+    if [ -s "$SIZING_JSON_ERR" ]; then
+        echo "jq error output:" | tee -a "$REPORT_FILE" >&2
+        head -n 20 "$SIZING_JSON_ERR" | sed 's/^/  /' | tee -a "$REPORT_FILE" >&2
+    fi
     rm -f "$SIZING_JSON"
 fi
 
