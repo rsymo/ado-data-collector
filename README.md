@@ -90,7 +90,7 @@ ORG="your-org-name" HISTORY_DAYS=7 DEBUG=1 ./ado-data-collector.sh
 | `MULT_LINUX` | `1` | Cost weighting for Linux job minutes |
 | `MULT_WINDOWS` | `2` | Cost weighting for Windows job minutes |
 | `MULT_MACOS` | `10` | Cost weighting for macOS job minutes. Defaults reflect GitHub-hosted standard runner ratios at the time of writing — confirm against current pricing |
-| `TOKEN_MAX_AGE` | `2400` | Seconds before the Azure AD token is refreshed |
+| `TOKEN_MAX_AGE` | `2400` | Seconds before the Microsoft Entra ID token is refreshed |
 | `API_RETRIES` | `5` | Retry attempts for a rate-limited or transient request |
 | `API_RETRY_MAX_TIME` | `120` | Ceiling in seconds on the total time any single request may spend retrying |
 | `API_PACING_MS` | `0` | Fixed delay before every request. Raise it (for example `250`) to pace a large run from the start |
@@ -231,7 +231,7 @@ The collector complements [`gh actions-importer audit azure-devops`](https://doc
 
 ## Security and privacy
 
-Authentication uses `az login` and short-lived Azure AD tokens; no PAT is required. Temporary data is cleaned up when the run finishes or is interrupted.
+Authentication uses `az login` and short-lived Microsoft Entra ID tokens; no PAT is required. Temporary data is cleaned up when the run finishes or is interrupted.
 
 Reports contain organizational information: project, repository, pipeline, agent pool, environment and service connection names, plus estate counts. Keep generated files in an approved, access-controlled location and do not commit them to source control.
 
